@@ -76,6 +76,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         distribution: Optional[str] = None,
         pert_sources: Optional[Dict] = None,
         control_label: str = "WT",
+        nuisance_spec: Optional[Union[str, Dict]] = None,
+        noise_dim: int = 0,
+        next_delta: bool = False,
+        next_delta_relative: bool = False,
         **kwargs
     ):
         # 1. Handle Training Config & Extras
@@ -142,6 +146,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if kwargs.get('pred_lochness_next', 0) > 0:
             self._hub_mixin_config['pred_lochness_next'] = kwargs['pred_lochness_next']
 
+        # Saved as a JSON string: the config sanitizer below drops dict values.
+        spec = json.loads(nuisance_spec) if isinstance(nuisance_spec, str) else dict(nuisance_spec or {})
+        if "wt_counterfactual" in spec.get("context", {}).values() and "control_index" not in spec:
+            spec["control_index"] = self.genotype_to_index[control_label]
+        self._hub_mixin_config['nuisance_spec'] = json.dumps(spec) if spec else None
+
         ntoken = len(vocab) if vocab is not None else None
         # 3. Initialize Parent (Without **kwargs, as you requested)
         super().__init__(
@@ -180,6 +190,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             pert_dim=pert_dim,
             pert_aggregation=pert_aggregation,
             pert_features=self.pert_features,
+            nuisance_spec=spec,
+            noise_dim=noise_dim,
+            next_delta=next_delta,
+            next_delta_control=self.genotype_to_index[control_label] if next_delta_relative else None,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
 

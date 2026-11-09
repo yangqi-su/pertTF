@@ -79,8 +79,10 @@ class BaseModel(nn.Module):
         self.nlayers = nlayers
         self.num_batch_labels = num_batch_labels
         self.n_input_bins = n_input_bins
-        self.use_fast_transformer = False if not torch.cuda.is_available() or fast_transformer_backend == 'vanilla' else use_fast_transformer
-        self.fast_transformer_backend = fast_transformer_backend if torch.cuda.is_available() else 'vanilla'
+        # SDPA layers also run on the CPU, so a model trained with them keeps its parameter layout there.
+        cpu_capable = fast_transformer_backend == 'sdpa'
+        self.use_fast_transformer = False if (not torch.cuda.is_available() and not cpu_capable) or fast_transformer_backend == 'vanilla' else use_fast_transformer
+        self.fast_transformer_backend = fast_transformer_backend if torch.cuda.is_available() or cpu_capable else 'vanilla'
         if self.use_fast_transformer and self.fast_transformer_backend == 'flash' and FLASH_ATTENTION_VERSION is None:
             print("⚠️ fast_transformer_backend='flash' requested but flash-attn is not installed; falling back to 'sdpa'.")
             self.fast_transformer_backend = 'sdpa'

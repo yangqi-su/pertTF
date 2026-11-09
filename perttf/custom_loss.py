@@ -32,6 +32,32 @@ def masked_mse_loss(
     return loss / mask.sum()
 
 
+def energy_score_loss(
+    pred_a: torch.Tensor, pred_b: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+    projection: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-pair energy score from two prediction draws: E||y_hat - y|| - 1/2 E||y_hat - y_hat'||.
+
+    Its expected value is lowest only when the predicted distribution equals the target's
+    (Gneiting & Raftery 2007), so with random targets it fits the target group's distribution,
+    not its mean. Distances use the genes in ``mask``; without ``projection`` each cell's distances
+    are divided by the square root of its gene count (a per-cell scale, which keeps the score
+    proper), with ``projection`` (genes x k, e.g. fixed PCA loadings) they are taken after
+    projecting. The norms are not squared: squared, the score only sees the mean.
+    """
+    m = mask.to(pred_a.dtype)
+    a, b, y = pred_a * m, pred_b * m, target * m
+    if projection is None:
+        scale = m.sum(dim=1).clamp_min(1.0).sqrt()
+    else:
+        a, b, y = a @ projection, b @ projection, y @ projection
+        scale = 1.0
+    d_a = (a - y).norm(dim=1) / scale
+    d_b = (b - y).norm(dim=1) / scale
+    d_ab = (a - b).norm(dim=1) / scale
+    return (0.5 * (d_a + d_b) - 0.5 * d_ab).mean()
+
+
 def criterion_neg_log_bernoulli(
     input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None
 ) -> torch.Tensor:

@@ -11,6 +11,7 @@ from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from typing import List, Tuple
 
 from torch import nn, Tensor
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from anndata import AnnData
@@ -28,7 +29,9 @@ import matplotlib.pyplot as plt
 from ..utils.set_optimizer import create_optimizer_dict
 from ..custom_loss import (
     cce_loss, 
+    SUPCON_loss,
     criterion_neg_log_bernoulli, 
+    energy_score_loss,
     masked_mse_loss, 
     masked_relative_error,
     GenerativeExpressionLoss,
@@ -112,6 +115,44 @@ def train(model: nn.Module,
         has_lochness_next_pred = False
         ps_next_training_weight = config.ps_weight * config.next_weight
 
+    # Nuisance labels (see the model's nuisance_spec) come from the batch for source and target.
+    nuisance_names = list(model.nuisance_spec.get("levels", {})) if hasattr(model, "nuisance_spec") else []
+    condition_names = list(model.nuisance_spec.get("conditions", {})) if nuisance_names else []
+    # energy_weight > 0: two noise draws per pair, fitted with the energy score, and the next-cell
+    # expression loss applied to the mean of the draws.
+    energy_weight = config.get("energy_weight", 0.0)
+    if energy_weight > 0 and (getattr(model, "noise_dim", 0) == 0 or config.distribution is not None):
+        raise ValueError("energy_weight needs a model with noise_dim > 0 and distribution=None")
+    projection = config.get("energy_projection", None)
+    if projection is not None:
+        projection = torch.as_tensor(np.load(projection), dtype=torch.float32, device=device)
+    # shift_contrastive_weight > 0: supervised contrastive loss on the perturbation shifts (output
+    # "pert_shift": the predicted state minus the control counterfactual of the same source and noise) of
+    # pairs whose target is a perturbed cell other than the source: shifts with the same target
+    # perturbation are pulled together across cell types, other perturbations pushed apart.
+    if config.get("next_loss_on_self_pairs", True) == "control":
+        control_label_id = model.genotype_to_index[resolve_control_value(config)]
+    shift_contrastive_weight = config.get("shift_contrastive_weight", 0.0)
+    shift_temperature = config.get("shift_contrastive_temperature", 0.1)
+    # shift_contrastive_center: contrast each shift minus the mean shift of the batch's contrasted pairs,
+    # so that the component shared by all perturbations does not enter the similarities.
+    shift_center = config.get("shift_contrastive_center", False)
+    if shift_contrastive_weight > 0:
+        control_id = model.genotype_to_index[resolve_control_value(config)]
+    # next_group_loss_weight > 0: group-level next-cell loss on pairs with a control source, self pairs
+    # included (a control self pair's real change is 0: the control leaves a cell unchanged) (the loader's
+    # next_group_means, real mean expression per group of training cells). Within each (source group,
+    # target group) of the batch, the predicted change from the source cell (pred - full_expr) is averaged
+    # over pairs and compared with the change between the two groups' real means. Copying the source and
+    # adding the group change scores zero, so, unlike the per-cell loss, it does not reward shrinking
+    # cells toward a mean. A real change between two group means carries sampling noise of variance
+    # proportional to 1/n_source + 1/n_target (cells per group); half the knockout groups of a cell type have
+    # fewer than ~30 cells, so each (source group, target group) is weighted by 1 / (1/n_source + 1/n_target).
+    group_weight = config.get("next_group_loss_weight", 0.0)
+    if group_weight > 0:
+        group_means = {k: v.to(device) if torch.is_tensor(v) else v for k, v in loader.next_group_means.items()}
+        group_control_id = model.genotype_to_index[resolve_control_value(config)]
+
     num_batches = len(loader)
     for batch, batch_data in enumerate(loader):
         input_gene_ids = batch_data["gene_ids"].to(device)
@@ -125,6 +166,20 @@ def train(model: nn.Module,
         sf_next = batch_data['sf_next'].to(device)
         celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
+        nuisance_labels = {n: batch_data[f"{n}_labels"].to(device) for n in nuisance_names} or None
+        nuisance_labels_next = {n: batch_data[f"{n}_labels_next"].to(device) for n in nuisance_names} or None
+        condition_labels = {n: batch_data[f"{n}_labels"].to(device) for n in condition_names}
+        # With next_loss_on_self_pairs=False, a cell paired with itself only trains reconstruction:
+        # its next-cell expression loss would otherwise train the perturbation head on identity.
+        # "control" keeps the next-cell loss on control self pairs only, which teaches the head that the
+        # control perturbation leaves a cell unchanged, without teaching identity for perturbed cells.
+        self_pair_mode = config.get("next_loss_on_self_pairs", True)
+        if self_pair_mode is True:
+            next_rows = torch.ones(input_gene_ids.shape[0], dtype=torch.bool, device=device)
+        else:
+            next_rows = (batch_data["index"] != batch_data["next_index"]).to(device)
+            if self_pair_mode == "control":
+                next_rows = next_rows | (perturbation_labels_next == control_label_id)
 
         mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
         if config.ps_weight >0:
@@ -141,7 +196,7 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or group_weight > 0 or has_lochness_next_pred )  else None,
                 sf = sf,
                 sf_next = sf_next,
                 MVC=config.GEPC,
@@ -150,7 +205,13 @@ def train(model: nn.Module,
                 CCE = config.CCE,
                 PERTPRED = config.get('genotype_classifier', True),
                 PSPRED = config.ps_weight >0,
-                mvc_src = mvc_src
+                mvc_src = mvc_src,
+                mvc_src_values=None if mvc_src is None else batch_data["full_expr"].to(device),
+                nuisance_labels=nuisance_labels,
+                nuisance_labels_next=nuisance_labels_next,
+                condition_labels=condition_labels,
+                n_noise_draws=2 if energy_weight > 0 else 1,
+                pert_labels_control=torch.full_like(perturbation_labels_next, control_id) if shift_contrastive_weight > 0 else None,
             )
 
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
@@ -236,13 +297,33 @@ def train(model: nn.Module,
                 loss = loss + config.this_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
-                loss_gepc_next = criterion_mvc(
-                    output_dict["mvc_output_next"], 
-                    mvc_target_values_next,
-                    mvc_next_masked_positions,
-                    scale_factor = sf_next,
-                )
-                loss = loss + config.next_weight * loss_gepc_next
+                mvc_output_next = output_dict["mvc_output_next"]
+                if energy_weight > 0:
+                    draw_a, draw_b = (d["pred"] for d in output_dict["mvc_output_next_draws"])
+                    mvc_output_next = {**mvc_output_next, "pred": (draw_a + draw_b) / 2}
+                # The next-cell loss covers only rows that are real pairs (next_rows; all rows by default).
+                next_positions = torch.ones_like(mvc_target_values_next, dtype=torch.bool) if mvc_next_masked_positions is None else mvc_next_masked_positions.bool()
+                next_positions = next_positions & next_rows.unsqueeze(1)
+                if next_rows.any():
+                    loss_gepc_next = criterion_mvc(
+                        mvc_output_next,
+                        mvc_target_values_next,
+                        next_positions,
+                        scale_factor = sf_next,
+                        positions = next_rows,
+                    )
+                    loss = loss + config.next_weight * loss_gepc_next
+                    if energy_weight > 0:
+                        # The CLS slot holds no expression.
+                        energy_positions = next_positions & (input_gene_ids if mvc_src is None else mvc_src).ne(vocab[config.get("cls_token", "<cls>")])
+                        loss_energy = energy_score_loss(
+                            draw_a[next_rows], draw_b[next_rows], mvc_target_values_next[next_rows],
+                            energy_positions[next_rows], projection,
+                        )
+                        loss = loss + energy_weight * loss_energy
+                        metrics_to_log.update({"train/energy": loss_energy.item()})
+                else:
+                    loss_gepc_next = torch.zeros((), device=device)
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
                 
                 if config.explicit_zero_prob and config.distribution is None:
@@ -294,6 +375,53 @@ def train(model: nn.Module,
                 loss_ps_next = criterion_ps(output_dict["ps_output_next"], ps_score_next)
                 loss = loss + ps_next_training_weight * loss_ps_next 
                 metrics_to_log.update({"train/ps_next": loss_ps_next.item()})
+
+            if shift_contrastive_weight > 0:
+                contrast_rows = (batch_data["index"] != batch_data["next_index"]).to(device) & (perturbation_labels_next != control_id)
+                if contrast_rows.sum() > 1:
+                    shifts = output_dict["pert_shift"][contrast_rows].float()
+                    if shift_center:
+                        shifts = shifts - shifts.mean(dim=0, keepdim=True)
+                    shifts = F.normalize(shifts, dim=1)
+                    # SUPCON_loss divides the dot products by temperature * dim and scales the loss by
+                    # temperature / base_temperature: these values give the usual cosine-similarity loss.
+                    tau = shift_temperature / shifts.shape[1]
+                    loss_shift = SUPCON_loss(shifts.unsqueeze(1), labels=perturbation_labels_next[contrast_rows],
+                                             temperature=tau, base_temperature=tau)
+                    loss = loss + shift_contrastive_weight * loss_shift
+                    metrics_to_log.update({"train/shift_contrastive": loss_shift.item()})
+
+            if group_weight > 0:
+                source_group, target_group = (
+                    group_means["table"][tuple(batch_data[f"{name}_labels{suffix}"].to(device) for name in group_means["names"])]
+                    for suffix in ("", "_next")
+                )
+                group_rows = (perturbation_labels == group_control_id) & (source_group >= 0) & (target_group >= 0)
+                if group_rows.any():
+                    genes = (batch_data["full_expr_mask"] & batch_data["full_expr_next_mask"]).to(device)[group_rows].float()
+                    genes[:, 0] = 0   # the CLS slot
+                    real_change = group_means["means"][target_group[group_rows]] - group_means["means"][source_group[group_rows]]
+                    residual = (output_dict["mvc_output_next"]["pred"][group_rows].float()
+                                - batch_data["full_expr"].to(device)[group_rows] - real_change) * genes
+                    pair_group = torch.unique(target_group[group_rows] * len(group_means["means"]) + source_group[group_rows], return_inverse=True)[1]
+                    n_pairs = torch.bincount(pair_group).unsqueeze(1)
+                    mean_residual = torch.zeros(len(n_pairs), residual.shape[1], device=device).index_add_(0, pair_group, residual) / n_pairs
+                    mean_genes = torch.zeros_like(mean_residual).index_add_(0, pair_group, genes) / n_pairs
+                    counts = group_means["counts"]
+                    pair_weight = 1 / (1 / counts[source_group[group_rows]] + 1 / counts[target_group[group_rows]])
+                    weight = torch.zeros(len(n_pairs), device=device).index_add_(0, pair_group, pair_weight) / n_pairs.squeeze(1)
+                    loss_group = (weight * mean_residual.pow(2).sum(1)).sum() / (weight * mean_genes.sum(1)).sum()
+                    loss = loss + group_weight * loss_group
+                    metrics_to_log.update({"train/next_group": loss_group.item()})
+
+            if "nuisance_adversary" in output_dict:
+                # The adversaries see the embedding through a gradient reversal: minimizing this
+                # trains them to read the nuisance labels and the encoder to hide them.
+                loss_nuisance_adv = sum(
+                    criterion_dab(logits, nuisance_labels[name]) for name, logits in output_dict["nuisance_adversary"].items()
+                )
+                loss = loss + config.get("nuisance_adversary_weight", 1.0) * loss_nuisance_adv
+                metrics_to_log.update({"train/nuisance_adv": loss_nuisance_adv.item()})
 
             if config.ecs_thres > 0:
                 loss_ecs = config.ecs_weight  * output_dict["loss_ecs"]
@@ -551,6 +679,15 @@ def _run_evaluation_batches(
             mvc_src = batch_data["full_gene_ids"].to(device) if (perturbation_validation or use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
             perturbation_kwargs = {}
+            # Batches without nuisance labels (e.g. AnnData prediction) are predicted at the reference level.
+            nuisance_names = list(model.nuisance_spec.get("levels", {})) if hasattr(model, "nuisance_spec") else []
+            if nuisance_names and f"{nuisance_names[0]}_labels" in batch_data:
+                perturbation_kwargs["nuisance_labels"] = {n: batch_data[f"{n}_labels"].to(device) for n in nuisance_names}
+                if has_targets:
+                    perturbation_kwargs["nuisance_labels_next"] = {n: batch_data[f"{n}_labels_next"].to(device) for n in nuisance_names}
+                perturbation_kwargs["condition_labels"] = {
+                    n: batch_data[f"{n}_labels"].to(device) for n in model.nuisance_spec.get("conditions", {})
+                }
             if perturbation_embeddings is not None and perturbation_labels_next is not None:
                 if perturbation_labels_next.dim() == 2:
                     # (batch, k, dim); the model reduces it with pert_labels_next, which masks the -1 pads
@@ -574,6 +711,7 @@ def _run_evaluation_batches(
                     PERTPRED=_cfg(config, "genotype_classifier", True) or collect_outputs,
                     PSPRED=_cfg(config, "ps_weight", 0) > 0 or collect_outputs,
                     mvc_src=mvc_src,
+                    mvc_src_values=None if mvc_src is None else batch_data["full_expr"].to(device),
                     **perturbation_kwargs,
                 )
 

@@ -1,3 +1,5 @@
+import json
+
 from torch import nn, Tensor
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from tqdm import trange
@@ -21,7 +23,10 @@ from .modules import (
     PSDecoder,
     Batch2LabelEncoder,
     PertLabelEncoder,
-    FeaturePertEncoder
+    FeaturePertEncoder,
+    NuisanceShift,
+    NuisanceAdversary,
+    NextDeltaDecoder,
     )
 
 
@@ -41,6 +46,28 @@ class PerturbationTFModel(BaseModel):
         # MLP instead of an independent lookup row, so novel (unseen-in-training)
         # conditions get a meaningful embedding -> enables zero-shot (regime-A) prediction.
         self.pert_features = kwargs.pop("pert_features", None)
+        # Nuisance labels of source and target cells (e.g. parent background, pool group), as a dict
+        # or its JSON string:
+        #   levels:    {name: number of levels};  reference: {name: level with no shift}
+        #   context:   {name: "source" | "state" | "wt_counterfactual"}, the detached state a target's
+        #              shift is read from (default "source"); self-pairs always read their own embedding
+        #   mode:      {name: "additive" | "inject" | "both"} (default "additive"): a shift added after
+        #              the perturbation head (cannot depend on genotype), the label as an input of the
+        #              perturbation head (may interact with genotype), or both, with the injected label
+        #              replaced by a null level with probability inject_dropout during training
+        #   conditions: {label: number of levels} given to the adversaries (e.g. celltype, day)
+        #   adversary: whether each nuisance gets an adversary on the cell embedding (default True)
+        #   control_index: perturbation ID of the control, for the WT counterfactual
+        spec = kwargs.pop("nuisance_spec", None)
+        self.nuisance_spec = json.loads(spec) if isinstance(spec, str) else (spec or {})
+        # Width of a Gaussian noise vector given to the perturbation head; 0 disables it.
+        self.noise_dim = kwargs.pop("noise_dim", 0)
+        # Decode next states with NextDeltaDecoder (a change applied to the source's observed expression,
+        # forward's mvc_src_values) instead of the MVC decoder, which still decodes the source itself.
+        self.next_delta = kwargs.pop("next_delta", False)
+        # Perturbation ID of the control. With next_delta, the head then reads the next state minus the
+        # control's state for the same cell and noise (with no bias), so the control leaves a cell unchanged.
+        self.next_delta_control = kwargs.pop("next_delta_control", None)
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
@@ -52,7 +79,26 @@ class PerturbationTFModel(BaseModel):
                 self.pert_features, pert_dim, padding_idx=self.pert_pad_id)
         else:
             self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
-        self.pert_exp_encoder = PertExpEncoder(d_model, self.pert_dim) 
+        levels = self.nuisance_spec.get("levels", {})
+        reference = self.nuisance_spec.get("reference", {})
+        modes = {name: self.nuisance_spec.get("mode", {}).get(name, "additive") for name in levels}
+        self.nuisance_input = nn.ModuleDict({name: nn.Embedding(n, d_model) for name, n in levels.items()})
+        self.nuisance_shift = nn.ModuleDict({
+            name: NuisanceShift(n, d_model, reference[name]) for name, n in levels.items() if modes[name] != "inject"
+        })
+        # The extra last level is the null label used for inject_dropout.
+        self.nuisance_inject = nn.ModuleDict({
+            name: nn.Embedding(n + 1, d_model) for name, n in levels.items() if modes[name] != "additive"
+        })
+        self.nuisance_adversary = nn.ModuleDict({
+            name: NuisanceAdversary(d_model, n, self.nuisance_spec.get("conditions", {}))
+            for name, n in levels.items()
+        } if self.nuisance_spec.get("adversary", True) else {})
+        self.pert_exp_encoder = PertExpEncoder(
+            d_model, self.pert_dim, extra_dim=self.noise_dim + d_model * len(self.nuisance_inject),
+        )
+        if self.next_delta:
+            self.next_decoder = NextDeltaDecoder(d_model, relative=self.next_delta_control is not None)
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
@@ -134,6 +180,7 @@ class PerturbationTFModel(BaseModel):
         src_key_padding_mask: Tensor,
         batch_labels: Optional[Tensor] = None,  # (batch,)
         input_pert_flags: Optional[Tensor] = None,
+        nuisance_labels: Optional[Dict[str, Tensor]] = None,
     ) -> Tensor:
         #print('_encode batch labels:')
         #print(batch_labels)
@@ -157,6 +204,14 @@ class PerturbationTFModel(BaseModel):
             perts_expand = perts.unsqueeze(1).repeat(1, total_embs.shape[1], 1)
             total_embs = total_embs + perts_expand
 
+        # The source cell's nuisance labels, so the encoder can subtract them; zero at the reference
+        # level, so a cell given no labels is encoded as the reference.
+        if nuisance_labels is not None:
+            for name, embedding in self.nuisance_input.items():
+                labels = nuisance_labels[name]
+                not_reference = (labels != self.nuisance_spec["reference"][name]).unsqueeze(1)
+                total_embs = total_embs + (embedding(labels) * not_reference).unsqueeze(1)
+
         # batch2 TODO: use batch_encoder instead
         if batch_labels is not None:
             batch2_embs = self.batch2_encoder(batch_labels)
@@ -179,6 +234,60 @@ class PerturbationTFModel(BaseModel):
         )
         return output  # (batch, seq_len, embsize)
 
+    def _next_states(self, cell_emb: Tensor, pert_emb_next: Tensor, pert_labels_next: Optional[Tensor],
+                     nuisance_labels_next: Optional[Dict[str, Tensor]], n_draws: int,
+                     pert_labels_control: Optional[Tensor] = None) -> tuple:
+        """Predicted target states, one per noise draw, the perturbation shift of the first draw and, with
+        next_delta_control, each draw's control state (u with the control's perturbation embedding, the same
+        source, injected labels and z; empty otherwise).
+
+        The shift (None without pert_labels_control) is u minus u with the control's perturbation
+        embedding, the same source and the same z: what the perturbation changes for this cell, before
+        the target's nuisance shifts.
+
+        u = pert_exp_encoder([cell_emb, pert_emb_next, injected target nuisance labels, z]) and
+        h = u + the target's nuisance shifts, each read from its detached context: the source
+        embedding, u itself ("state"), or the WT counterfactual w, u with the control's
+        perturbation embedding and the same z ("wt_counterfactual").
+        """
+        n = cell_emb.shape[0]
+        reference = self.nuisance_spec.get("reference", {})
+        inject = []
+        for name, embedding in self.nuisance_inject.items():
+            labels = reference[name] * torch.ones(n, dtype=torch.long, device=cell_emb.device) \
+                if nuisance_labels_next is None else nuisance_labels_next[name]
+            if self.training and self.nuisance_spec.get("mode", {}).get(name) == "both":
+                null = torch.rand(n, device=cell_emb.device) < self.nuisance_spec.get("inject_dropout", 0.5)
+                labels = torch.where(null, embedding.num_embeddings - 1, labels)
+            inject.append(embedding(labels))
+        contexts = self.nuisance_spec.get("context", {})
+        if "wt_counterfactual" in contexts.values():
+            shape = (n,) if pert_labels_next is None or pert_labels_next.dim() == 1 else (n, 1)
+            control = torch.full(shape, self.nuisance_spec["control_index"], dtype=torch.long, device=cell_emb.device)
+            pert_emb_wt = encode_perturbation_set(self.pert_encoder, control, self.pert_aggregation)
+        states, pert_shift, control_states = [], None, []
+        if self.next_delta_control is not None:
+            control = torch.full((n,), self.next_delta_control, dtype=torch.long, device=cell_emb.device)
+            pert_emb_delta_control = encode_perturbation_set(self.pert_encoder, control, self.pert_aggregation)
+        for _ in range(n_draws):
+            noise = [torch.randn(n, self.noise_dim, device=cell_emb.device, dtype=cell_emb.dtype)] if self.noise_dim else []
+            state = self.pert_exp_encoder(torch.cat([cell_emb, pert_emb_next, *inject, *noise], dim=1))
+            if not states and pert_labels_control is not None:
+                pert_emb_control = encode_perturbation_set(self.pert_encoder, pert_labels_control, self.pert_aggregation)
+                pert_shift = state - self.pert_exp_encoder(torch.cat([cell_emb, pert_emb_control, *inject, *noise], dim=1))
+            if self.next_delta_control is not None:
+                control_states.append(self.pert_exp_encoder(torch.cat([cell_emb, pert_emb_delta_control, *inject, *noise], dim=1)))
+            if nuisance_labels_next is not None and len(self.nuisance_shift) > 0:
+                context_of = {"source": cell_emb, "state": state}
+                if "wt_counterfactual" in contexts.values():
+                    context_of["wt_counterfactual"] = self.pert_exp_encoder(torch.cat([cell_emb, pert_emb_wt, *inject, *noise], dim=1))
+                shifted = state
+                for name, shift in self.nuisance_shift.items():
+                    shifted = shifted + shift(nuisance_labels_next[name], context_of[contexts.get(name, "source")].detach())
+                state = shifted
+            states.append(state)
+        return states, pert_shift, control_states
+
     def forward(
         self,
         src: Tensor,
@@ -198,6 +307,12 @@ class PerturbationTFModel(BaseModel):
         PSPRED: bool = False,
         mvc_src: Tensor = None,
         pert_embeddings_next: Optional[Tensor] = None,
+        nuisance_labels: Optional[Dict[str, Tensor]] = None,
+        nuisance_labels_next: Optional[Dict[str, Tensor]] = None,
+        condition_labels: Optional[Dict[str, Tensor]] = None,
+        n_noise_draws: int = 1,
+        pert_labels_control: Optional[Tensor] = None,
+        mvc_src_values: Optional[Tensor] = None,
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -220,6 +335,13 @@ class PerturbationTFModel(BaseModel):
                 (PERTPRED) output. 
             PSPRED (:obj:`bool`): if True, return the PS score prediction 
                 (PERTPRED) output. 
+            nuisance_labels / nuisance_labels_next ({name: Tensor}): the source / target cells'
+                nuisance labels (see nuisance_spec); None means the reference level.
+            condition_labels ({name: Tensor}): the source cells' labels given to the adversaries.
+            n_noise_draws (int): next states predicted with independent noise vectors; draws after
+                the first are returned as "mvc_output_next_draws" (with MVC).
+            mvc_src_values (:obj:`Tensor`): the source cells' log1p expression on the mvc_src genes, the
+                base of the next-cell prediction with next_delta.
 
         Returns:
             dict of output Tensors.
@@ -244,6 +366,7 @@ class PerturbationTFModel(BaseModel):
         transformer_output_0 = self._encode(
             src, values, src_key_padding_mask, batch_labels,
             input_pert_flags= pert_labels, # Do we use pert_flags for transformer input?
+            nuisance_labels=nuisance_labels,
         )
         if self.use_batch_labels:
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
@@ -293,6 +416,11 @@ class PerturbationTFModel(BaseModel):
 
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
         output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
+        # Reconstruction of the source cell: its own nuisance shifts, read from its own embedding.
+        self_state = cell_emb_orig
+        if nuisance_labels is not None:
+            for name, shift in self.nuisance_shift.items():
+                self_state = self_state + shift(nuisance_labels[name], cell_emb_orig.detach())
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
         if pert_labels_next is not None or pert_embeddings_next is not None:
             #import pdb; pdb.set_trace()
@@ -305,18 +433,14 @@ class PerturbationTFModel(BaseModel):
             expected_pert_dim = self.d_model if self.pert_dim is None else self.pert_dim
             if pert_emb_next.shape != (src.shape[0], expected_pert_dim):
                 raise ValueError("pert_embeddings_next must have shape (batch_size, pert_dim)")
-            tf_concat=torch.cat(
-                [
-                    cell_emb_orig,
-                    pert_emb_next,
-                ],
-                dim=1,
-            )
-            #tf_concat = cell_emb_orig + pert_emb_next
-            cell_emb_next=self.pert_exp_encoder(tf_concat)
+            next_states, pert_shift, control_states = self._next_states(cell_emb_orig, pert_emb_next, pert_labels_next, nuisance_labels_next,
+                                                        n_noise_draws, pert_labels_control)
+            cell_emb_next = next_states[0]
+            if pert_shift is not None:
+                output["pert_shift"] = pert_shift
             output["contrastive_dict"]['next_emb0'] = cell_emb_next
         else:
-            tf_concat = None # add a placeholder
+            next_states, control_states = [cell_emb_orig], []
             cell_emb_next=cell_emb_orig
         
         cell_emb = cell_emb_orig
@@ -330,21 +454,24 @@ class PerturbationTFModel(BaseModel):
         cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
         if MVC and hasattr(self, 'mvc_decoder'):
             mvc_output = self.mvc_decoder(
-                cell_emb
+                self_state
                 if not self.use_batch_labels
-                else torch.cat([cell_emb, batch_emb], dim=1),
+                else torch.cat([self_state, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs,
                 target_size_factor = sf if self.distribution is not None else None
             )
-            mvc_output_next = self.mvc_decoder(
-                cell_emb_next
-                if not self.use_batch_labels
-                else torch.cat([cell_emb_next, batch_emb], dim=1),
-                # else cell_emb + batch_emb,
-                cur_gene_token_embs, # is it working well??
-                target_size_factor = sf_next if self.distribution is not None else None
-            )
+            def decode_next(state, control_state=None):
+                if self.next_delta:
+                    if control_state is not None:
+                        state = state - control_state
+                    return self.next_decoder(state, cur_gene_token_embs, mvc_src_values)
+                return self.mvc_decoder(
+                    state if not self.use_batch_labels else torch.cat([state, batch_emb], dim=1),
+                    cur_gene_token_embs,
+                    target_size_factor=sf_next if self.distribution is not None else None,
+                )
+            mvc_output_next = decode_next(cell_emb_next, control_states[0] if control_states else None)
             if self.explicit_zero_prob and False: # bernoulli sampling is meaningless here
                 bernoulli = Bernoulli(probs=mvc_output["zero_probs"])
                 output["mvc_output"] = bernoulli.sample() * mvc_output["pred"]
@@ -354,6 +481,10 @@ class PerturbationTFModel(BaseModel):
             else:
                 output["mvc_output"] = mvc_output  # (batch, seq_len)
                 output["mvc_output_next"] = mvc_output_next  # (batch, seq_len)
+            if len(next_states) > 1:
+                output["mvc_output_next_draws"] = [mvc_output_next] + [
+                    decode_next(state, control_states[i] if control_states else None) for i, state in enumerate(next_states[1:], 1)
+                ]
 
         if ECS and hasattr(self, 'sim'):
             # Here using customized cosine similarity instead of F.cosine_similarity
@@ -372,6 +503,11 @@ class PerturbationTFModel(BaseModel):
 
         if self.do_dab:
             output["dab_output"] = self.grad_reverse_discriminator(cell_emb)
+
+        if nuisance_labels is not None and len(self.nuisance_adversary) > 0:
+            output["nuisance_adversary"] = {
+                name: adversary(cell_emb_orig, condition_labels or {}) for name, adversary in self.nuisance_adversary.items()
+            }
 
 
         # get cell embedding

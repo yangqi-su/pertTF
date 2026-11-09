@@ -750,11 +750,13 @@ class PertExpEncoder(nn.Module):
     def __init__(
         self,
         d_model: int,
-        pert_dim: int = None
+        pert_dim: int = None,
+        extra_dim: int = 0,
     ):
         super().__init__()
         pert_dim = d_model if pert_dim is None else pert_dim
-        d_in = d_model + pert_dim
+        # extra_dim: further inputs concatenated after the perturbation embedding (noise, injected nuisance labels)
+        d_in = d_model + pert_dim + extra_dim
         #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
@@ -1087,6 +1089,52 @@ class MVCDecoder(nn.Module):
             "distribution": self.distribution
         }
 
+
+class NextDeltaDecoder(nn.Module):
+    """Next-cell expression as a change applied to the source cell's observed expression.
+
+    On the normalised-count scale of the log1p inputs (expm1 of the source values), per gene j:
+        m_next[j] = exp(delta[j]) * x_src[j] + exp(add[j])
+    exp(delta) scales the expression the source has (decrease or increase); exp(add) is expression added
+    where the source has little or none (a gene switched on, or one the source cell did not sample).
+    delta and add are read from the next state with a query from the gene embedding, as MVCDecoder's inner
+    product; add also has a gene-specific offset. At initialisation delta = 0 and exp(add) = exp(add_init),
+    so the prediction starts as the source cell itself, and the mean over a group of source cells starts
+    at the group's real mean. Returns pred = log1p(m_next), the scale of the log-normalised targets
+    (distribution None).
+
+    With relative=True the input is a state difference (the next state minus the control's state) and the
+    added expression is exp(add) - exp(offset), so a zero difference returns the source exactly; a gene
+    can then lose added expression too, and m_next is clipped at 0.
+    """
+
+    def __init__(self, d_model: int, add_init: float = -3.0, relative: bool = False):
+        super().__init__()
+        self.relative = relative
+        self.gene2query = nn.Linear(d_model, d_model)
+        self.query_activation = nn.Sigmoid()
+        self.W_delta = nn.Linear(d_model, d_model, bias=False)
+        self.W_add = nn.Linear(d_model, d_model, bias=False)
+        self.add_offset = nn.Linear(d_model, 1)
+        for layer in (self.W_delta, self.W_add, self.add_offset):
+            nn.init.zeros_(layer.weight)
+        nn.init.constant_(self.add_offset.bias, add_init)
+
+    def forward(self, state: Tensor, gene_embs: Tensor, src_values: Tensor) -> Dict[str, Tensor]:
+        query = self.query_activation(self.gene2query(gene_embs))   # (batch, genes, d_model)
+        state = state.unsqueeze(2)
+        delta = torch.bmm(self.W_delta(query), state).squeeze(2).float()
+        offset = self.add_offset(query).squeeze(2).float()
+        add = torch.bmm(self.W_add(query), state).squeeze(2).float() + offset
+        # The CLS slot and padding hold negative values: no expression.
+        source = torch.expm1(src_values.float()).clamp(min=0)
+        if self.relative:
+            pred = torch.log1p((torch.exp(delta) * source + torch.exp(add) - torch.exp(offset)).clamp(min=0))
+        else:
+            pred = torch.log1p(torch.exp(delta) * source + torch.exp(add))
+        return {"pred": pred, "param2": None, "zero_probs": torch.ones_like(pred), "distribution": None}
+
+
 from torch.autograd import Function
 class GradReverse(Function):
     @staticmethod
@@ -1213,3 +1261,39 @@ class AdversarialDiscriminator(nn.Module):
         for layer in self._decoder:
             x = layer(x)
         return self.out_layer(x)
+
+class NuisanceShift(nn.Module):
+    """A shift of the cell state caused by a nuisance label (e.g. parent background, pool group).
+
+    shift = MLP([embedding(label), context]), where context is a state the caller detaches (the
+    source embedding, the predicted state, or a WT counterfactual), so the shift can depend on the
+    cell's state but nothing upstream is trained to feed it. The reference level has no shift, so
+    a cell given no labels is predicted at the reference.
+    """
+
+    def __init__(self, n_levels: int, d_model: int, reference: int):
+        super().__init__()
+        self.reference = reference
+        self.embedding = nn.Embedding(n_levels, d_model)
+        self.fc = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+
+    def forward(self, labels: Tensor, context: Tensor) -> Tensor:
+        shift = self.fc(torch.cat([self.embedding(labels), context], dim=1))
+        return shift * (labels != self.reference).unsqueeze(1).to(shift.dtype)
+
+
+class NuisanceAdversary(nn.Module):
+    """Predicts a nuisance label from the cell embedding through a gradient reversal, so the encoder
+    is trained to hide it. Condition labels (e.g. cell type, day) are given to the classifier, so
+    only nuisance information beyond what cell type and day explain is removed."""
+
+    def __init__(self, d_model: int, n_levels: int, condition_levels: Dict[str, int]):
+        super().__init__()
+        self.conditions = nn.ModuleDict({name: nn.Embedding(n, d_model) for name, n in condition_levels.items()})
+        self.fc = nn.Sequential(nn.Linear(d_model, d_model), nn.LeakyReLU(), nn.Linear(d_model, n_levels))
+
+    def forward(self, cell_emb: Tensor, condition_labels: Dict[str, Tensor]) -> Tensor:
+        x = grad_reverse(cell_emb)
+        for name, embedding in self.conditions.items():
+            x = x + embedding(condition_labels[name])
+        return self.fc(x)

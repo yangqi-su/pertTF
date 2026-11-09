@@ -477,6 +477,12 @@ class PertTFPairedBatchLoader:
     ``labels`` gives {label: ID} for some or all label names of ``config.label_fields``; the
     others are numbered in order of first appearance in ``rows`` (with ``pert_delimiter``, the
     perturbation's components). The target's labels are the target cell's own.
+
+    With ``steps_per_epoch`` the loader runs in step mode instead: each batch is ``batch_size``
+    pairs drawn with replacement by the sampler's pair weights (``Sampler.sample_batch``), and an
+    epoch is ``steps_per_epoch`` such batches, numbered across epochs so each batch is
+    reproducible from (seed, step). ``pair_rules`` (``corpus_pairs.PairRules``) adds each pair's
+    rule ID as ``pair_rule``.
     """
 
     def __init__(
@@ -499,6 +505,8 @@ class PertTFPairedBatchLoader:
         device: torch.device | str = "cpu",
         build_in_workers: bool = False,
         batches_per_read: int = 1,
+        steps_per_epoch: int | None = None,
+        pair_rules=None,
     ) -> None:
         if config.sampling_mode not in SAMPLING_MODES:
             raise ValueError(f"sampling_mode must be one of {SAMPLING_MODES}, got {config.sampling_mode!r}")
@@ -509,6 +517,7 @@ class PertTFPairedBatchLoader:
         self.rows = np.asarray(rows, dtype=np.int64)
         self.seq_len, self.batch_size, self.cover = seq_len, batch_size, cover
         self.seed, self.drop_last = seed, drop_last
+        self.steps_per_epoch, self.pair_rules = steps_per_epoch, pair_rules
         self.device = torch.device(device)
         self.epoch = 0
         self._batches = None
@@ -564,6 +573,13 @@ class PertTFPairedBatchLoader:
         self._batches = None
 
     def _epoch_batches(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        if self._batches is None and self.steps_per_epoch is not None:
+            first = self.epoch * self.steps_per_epoch
+            self._batches = []
+            for step in range(first, first + self.steps_per_epoch):
+                pairs = [pair for sample in self.sampler.sample_batch(step, self.batch_size, seed=self.seed) for pair in sample]
+                self._batches.append((np.array([s for s, _ in pairs for s in s], dtype=np.int64),
+                                      np.array([t for _, t in pairs for t in t], dtype=np.int64)))
         if self._batches is None:
             source, target = self.sampler.epoch_rows(self.epoch, seed=self.seed, cover=self.cover)
             size = self.batch_size
@@ -592,6 +608,8 @@ class PertTFPairedBatchLoader:
         if self._perturbation_names is not None:
             # Multi-perturbation validation groups predictions by the target's label, not its ID set.
             batch["pert_name_next"] = self._perturbation_names.gather(target).to_numpy()
+        if self.pair_rules is not None:
+            batch["pair_rule"] = torch.as_tensor(self.pair_rules(source, target), dtype=torch.long, device=self.device)
         return batch
 
     def _labels(self, source, target) -> tuple[dict, dict]:

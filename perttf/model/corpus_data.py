@@ -6,10 +6,14 @@ from dataclasses import asdict
 
 import anndata as ad
 import numpy as np
+import torch
 
 from scorpus.loaders import dense_counts
 
-from .corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, default_pair_sampler
+from scorpus.pairing import Sampler
+
+from .corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, _size_factors, default_pair_sampler
+from .corpus_pairs import PairRules, PerturbationBlockSampler
 from .pert_emb import build_perturbation_mapping
 from .train_data_gen import _record_config_value
 from ..utils.custom_tokenizer import SimpleVocab
@@ -39,6 +43,34 @@ def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column
     return moments.finalize()
 
 
+def next_group_means(corpus, rows: np.ndarray, codes: np.ndarray, n_levels: list[int], target_sum: float,
+                     chunk_rows: int = 1024) -> dict:
+    """Mean log1p expression of every group of the cells at corpus ``rows``, as the batches' full_expr.
+
+    ``codes`` (rows x labels) holds each cell's label IDs; a group is a distinct row of codes. Cells are
+    scaled with the loaders' size factors, on the corpus gene axis, with full_expr's CLS column first
+    (0 here). Returns {"table": ID lookup of shape n_levels (-1 where no group), "means": (groups, 1 + genes),
+    "counts": cells per group}.
+    """
+    unique, group = np.unique(codes, axis=0, return_inverse=True)
+    group = group.ravel()
+    n_genes = corpus.feature_registry.global_vocab_size
+    dataset_index = corpus.metadata_index.df["dataset_index"].to_numpy()[rows]
+    size_factor = _size_factors(corpus, rows, dataset_index, target_sum)
+    sums = np.zeros((len(unique), n_genes))
+    for start in range(0, len(rows), chunk_rows):
+        selected = slice(start, start + chunk_rows)
+        batch = corpus.expression_reader.read_expression_flat(rows[selected].tolist())
+        counts, _ = dense_counts(corpus, batch, genes=np.arange(n_genes))
+        np.add.at(sums, group[selected], np.log1p(counts / size_factor[selected, None]))
+    counts = np.bincount(group, minlength=len(unique))
+    means = sums / counts[:, None]
+    table = np.full(n_levels, -1, dtype=np.int64)
+    table[tuple(unique.T)] = np.arange(len(unique))
+    return {"table": torch.as_tensor(table), "means": torch.as_tensor(np.hstack([np.zeros((len(unique), 1)), means]), dtype=torch.float32),
+            "counts": torch.as_tensor(counts, dtype=torch.float32)}
+
+
 def produce_corpus_datasets(
     corpus,
     config,
@@ -56,6 +88,12 @@ def produce_corpus_datasets(
     tokenizer_stoi: dict | None = None,
     feature_id_to_token: dict | None = None,
     pairing_columns: tuple[str, ...] = (),
+    extra_label_columns: dict[str, str] | None = None,
+    extra_label_to_index: dict[str, dict] | None = None,
+    train_pairs=None,
+    steps_per_epoch: int | None = None,
+    max_perturbations_per_batch: int | None = None,
+    next_group_labels: tuple[str, ...] | None = None,
     target_sum: float | None = 10000.0,
     num_workers: int = 0,
     device="cpu",
@@ -75,6 +113,20 @@ def produce_corpus_datasets(
     The one expanded perturbation mapping is shared by both loaders and must be
     passed unchanged to the model/UnifiedPertEncoder. Supply tokenizer_stoi when
     using a pretrained expression vocabulary.
+
+    ``extra_label_columns`` ({metadata column: label name}, e.g. background, pool group, day) adds
+    labels that every batch carries for source and target (``<name>_labels``/``<name>_labels_next``);
+    ``extra_label_to_index`` fixes some of their IDs. ``train_pairs`` = (groups, pairs) replaces
+    the default training pairs: groups built with ``make_groups`` on the metadata of
+    ``train_indices`` (in that order), and a pair table with a ``link`` column, a ``rule`` column
+    and optionally a weight ``w`` (``corpus_pairs``). With ``steps_per_epoch`` training runs in
+    step mode (draws by ``w``); validation always covers every validation target once.
+    ``max_perturbations_per_batch`` (step mode) limits each training batch to pairs of that many
+    target perturbations plus control-target pairs (``PerturbationBlockSampler``).
+    ``next_group_labels`` (label names besides celltype and perturbation, e.g. ("background", "pool"))
+    attaches to the training loader ``next_group_means``: the real mean expression of every group of
+    training cells sharing celltype, perturbation and these labels, for the group-level next-cell loss
+    (config ``next_group_loss_weight``). It needs a fixed ``target_sum``.
 
     Perturbation metrics use the tokenizable intersection of the validation
     datasets' feature panels. Full-expression losses use availability masks.
@@ -106,9 +158,10 @@ def produce_corpus_datasets(
     if configured_control not in (None, control_label):
         raise ValueError(f"control_label={control_label!r} contradicts the config's control {configured_control!r}")
     _record_config_value(config, "perturbation_control_value", control_label)
-    label_fields = {perturbation_column: "perturbation", celltype_column: "celltype", batch_column: "batch"}
-    if len(label_fields) != 3:
-        raise ValueError("Perturbation, celltype, and batch columns must be distinct")
+    extra_label_columns = extra_label_columns or {}
+    label_fields = {perturbation_column: "perturbation", celltype_column: "celltype", batch_column: "batch", **extra_label_columns}
+    if len(label_fields) != 3 + len(extra_label_columns) or len(set(label_fields.values())) != len(label_fields):
+        raise ValueError("Label columns and label names must be distinct")
     context_columns = list(dict.fromkeys(("dataset_id", celltype_column, *pairing_columns)))
     frame = corpus.metadata_index.df.select(list(dict.fromkeys(["dataset_index", *label_fields, *context_columns]))).to_pandas()
     selected_rows = np.union1d(train_indices, valid_indices)
@@ -158,6 +211,10 @@ def produce_corpus_datasets(
         "celltype": cell_type_to_index or {label: i for i, label in enumerate(dict.fromkeys(selected_frame[celltype_column]))},
         "batch": batch_to_index or {label: i for i, label in enumerate(dict.fromkeys(selected_frame[batch_column]))},
     }
+    for column, name in extra_label_columns.items():
+        labels[name] = (extra_label_to_index or {}).get(name) or {
+            label: i for i, label in enumerate(dict.fromkeys(selected_frame[column]))
+        }
     # A pretrained vocabulary need not have every corpus gene; genes without a token are left out.
     tokens = GeneTokens.from_corpus(
         corpus, tokenizer_stoi, feature_id_to_token, pad_token=config.get("pad_token", "<pad>"),
@@ -177,9 +234,21 @@ def produce_corpus_datasets(
     metadata = corpus.metadata_index.df
     pairing = dict(context_columns=context_columns, perturbation_column=perturbation_column, control_labels=(control_label,))
     train_rows = np.asarray(train_indices, dtype=np.int64)
+    if train_pairs is None:
+        train_sampler, pair_rules = default_pair_sampler(metadata[train_rows], perturbed_to_self=True, **pairing), None
+    else:
+        groups, pairs = train_pairs
+        if groups.n_rows != len(train_rows):
+            raise ValueError("train_pairs groups must be built on the metadata of train_indices")
+        if max_perturbations_per_batch is None:
+            train_sampler = Sampler(groups, pairs, links="link", weight="w" if "w" in pairs.columns else None)
+        else:
+            train_sampler = PerturbationBlockSampler(groups, pairs, perturbation=perturbation_column, control=control_label,
+                                                     max_perturbations=max_perturbations_per_batch)
+        pair_rules = PairRules(groups, pairs)
     train_loader = PertTFPairedBatchLoader(
-        corpus, rows=train_rows, cover="source",
-        sampler=default_pair_sampler(metadata[train_rows], perturbed_to_self=True, **pairing), **options,
+        corpus, rows=train_rows, cover="source", sampler=train_sampler,
+        steps_per_epoch=steps_per_epoch, pair_rules=pair_rules, **options,
     )
     valid_rows = np.asarray(valid_indices, dtype=np.int64)
     valid_loader = PertTFPairedBatchLoader(
@@ -192,6 +261,13 @@ def produce_corpus_datasets(
     if not metric_gene_mask.any():
         raise ValueError("Validation datasets have no shared tokenizable genes")
     valid_loader.metric_gene_mask = metric_gene_mask
+    if next_group_labels is not None:
+        if target_sum is None:
+            raise ValueError("next_group_labels needs a fixed target_sum: the group means use the loaders' size factors")
+        names = ("celltype", "perturbation", *next_group_labels)
+        column_of = {name: column for column, name in label_fields.items()}
+        codes = np.stack([frame.iloc[train_rows][column_of[name]].map(labels[name]).astype(np.int64).to_numpy() for name in names], axis=1)
+        train_loader.next_group_means = {"names": names, **next_group_means(corpus, train_rows, codes, [max(labels[n].values()) + 1 for n in names], target_sum)}
     reference_groups = corpus_reference_groups(
         corpus, valid_rows, context_column=celltype_column,
         perturbation_column=perturbation_column, gene_mask=metric_gene_mask,
@@ -209,6 +285,8 @@ def produce_corpus_datasets(
         "genes": genes, "gene_ids": tokens.token_of_gene,
         "genotype_to_index": dict(mapping), "cell_type_to_index": labels["celltype"],
         "num_batch_types": len(labels["batch"]), "ps_names": [],
+        "extra_label_to_index": {name: labels[name] for name in extra_label_columns.values()},
+        "pair_rule_names": None if pair_rules is None else pair_rules.names,
         "perturbation_validation": True, "control_label": control_label, "max_n_pert": max_n_pert,
         "perturbation_reference_groups": reference_groups,
         "metric_gene_ids": genes[metric_gene_mask],
@@ -216,6 +294,7 @@ def produce_corpus_datasets(
         "corpus_config": {
             "adapter": asdict(adapter_config),
             "batch_to_index": labels["batch"],
+            "extra_label_to_index": {name: labels[name] for name in extra_label_columns.values()},
             "expression_kinds": dict(corpus.expression_kinds),
             "metric_gene_ids": genes[metric_gene_mask].tolist(),
         },
