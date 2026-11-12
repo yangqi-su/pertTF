@@ -14,7 +14,7 @@ from scipy import sparse
 
 from scorpus import concat, from_h5ad
 from scorpus.pairing import Sampler, make_groups
-from perttf.custom_loss import energy_score_loss
+from perttf.custom_loss import energy_score_loss, group_energy_distance, straight_through_counts
 from perttf.model.corpus_data import next_group_means, produce_corpus_datasets
 from perttf.model.corpus_pairs import (PairRules, PerturbationBlockSampler, branch_weights, development_pairs,
                                        same_celltype_pairs)
@@ -194,6 +194,31 @@ def test_relative_next_delta_leaves_control_cells_unchanged():
     assert not torch.allclose(out["mvc_output_next"]["pred"][1], values[1])
 
 
+def test_straight_through_counts_are_counts_around_the_prediction():
+    torch.manual_seed(0)
+    sf = torch.full((20000, 1), 2.0)                      # normalised = counts x 2
+    source = torch.log1p(torch.tensor([[2.0, 0.0, 6.0]]) * 2).expand(20000, -1)   # raw counts 2, 0, 6
+    pred = torch.log1p(torch.tensor([[1.0, 0.05, 6.0]]) * 2).expand(20000, -1).clone().requires_grad_(True)
+    drawn = straight_through_counts(pred, source, sf)
+    counts = torch.expm1(drawn.detach()) / sf
+    assert torch.allclose(counts, counts.round(), atol=1e-3)
+    assert torch.allclose(counts.mean(0), torch.tensor([1.0, 0.05, 6.0]), atol=0.03)
+    assert abs((counts[:, 0] == 0).float().mean().item() - 0.25) < 0.02   # Binomial(2, 1/2)
+    assert torch.allclose(counts[:, 2], torch.full((20000,), 6.0), atol=1e-4)   # unchanged gene, unchanged counts
+    drawn.sum().backward()
+    assert torch.isfinite(pred.grad).all() and (pred.grad > 0).all()
+
+
+def test_group_energy_distance_compares_distributions():
+    torch.manual_seed(0)
+    projection = torch.eye(4)
+    same = torch.randn(400, 4), torch.randn(400, 4)
+    shifted_spread = torch.randn(400, 4), torch.randn(400, 4) * 3
+    groups = torch.zeros(400, dtype=torch.long)
+    assert abs(group_energy_distance(*same, groups, projection).item()) < 0.05
+    assert group_energy_distance(*shifted_spread, groups, projection).item() > 0.5   # same mean, different spread
+
+
 def test_next_group_means_match_full_expr(tmp_path):
     corpus, obs = nuisance_corpus(tmp_path)
     rows = np.arange(len(obs))
@@ -230,8 +255,10 @@ def nuisance_corpus(tmp_path):
     return concat({"a": member}, obs_columns={c: {"a": c} for c in columns}, feature_key={"a": "index"}), obs
 
 
-@pytest.mark.parametrize("next_delta, group_loss, relative", [(False, False, False), (True, False, False), (True, True, False), (True, True, True)])
-def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_delta, group_loss, relative):
+@pytest.mark.parametrize("next_delta, group_loss, relative, group_energy", [
+    (False, False, False, False), (True, False, False, False), (True, True, False, False), (True, True, True, False),
+    (True, True, True, True)])
+def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_delta, group_loss, relative, group_energy):
     torch.set_num_threads(2)
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     parameters = dict(
@@ -249,7 +276,11 @@ def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_del
         dataset_name="synthetic_nuisance", energy_weight=1.0, next_loss_on_self_pairs="control",
         nuisance_adversary_weight=0.5, shift_contrastive_weight=0.5, shift_contrastive_center=True,
         next_group_loss_weight=1.0 if group_loss else 0.0,
+        next_group_energy_weight=1.0 if group_energy else 0.0,
     )
+    if group_energy:
+        np.save(tmp_path / "projection.npy", np.eye(3, 2))   # the synthetic corpus has 3 genes
+        parameters["next_group_energy_projection"] = str(tmp_path / "projection.npy")
     if group_loss:
         parameters.update(next_weight=0.0, energy_weight=0.0)
     with wandb.init(mode="disabled", config=parameters) as run:

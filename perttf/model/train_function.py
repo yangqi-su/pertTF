@@ -32,7 +32,9 @@ from ..custom_loss import (
     SUPCON_loss,
     criterion_neg_log_bernoulli, 
     energy_score_loss,
+    group_energy_distance,
     masked_mse_loss, 
+    straight_through_counts,
     masked_relative_error,
     GenerativeExpressionLoss,
     perturbation_classification_loss,
@@ -152,6 +154,14 @@ def train(model: nn.Module,
     if group_weight > 0:
         group_means = {k: v.to(device) if torch.is_tensor(v) else v for k, v in loader.next_group_means.items()}
         group_control_id = model.genotype_to_index[resolve_control_value(config)]
+    # next_group_energy_weight > 0 (with the group loss): within the same (source group, target group) sets, the
+    # energy distance between the predicted cells, drawn as counts around the prediction from each source cell
+    # (straight_through_counts), and the real target cells, after a fixed projection (next_group_energy_projection,
+    # genes x k .npy, e.g. principal components). The group loss fits each gene's mean change; this term fits how
+    # the cells of a group are distributed, e.g. how the change varies from cell to cell.
+    group_energy_weight = config.get("next_group_energy_weight", 0.0)
+    if group_energy_weight > 0:
+        group_projection = torch.as_tensor(np.load(config["next_group_energy_projection"]), dtype=torch.float32, device=device)
 
     num_batches = len(loader)
     for batch, batch_data in enumerate(loader):
@@ -413,6 +423,15 @@ def train(model: nn.Module,
                     loss_group = (weight * mean_residual.pow(2).sum(1)).sum() / (weight * mean_genes.sum(1)).sum()
                     loss = loss + group_weight * loss_group
                     metrics_to_log.update({"train/next_group": loss_group.item()})
+                    if group_energy_weight > 0:
+                        drawn = straight_through_counts(output_dict["mvc_output_next"]["pred"][group_rows, 1:].float(),
+                                                        batch_data["full_expr"].to(device)[group_rows, 1:],
+                                                        batch_data["sf"].to(device)[group_rows])
+                        loss_energy = group_energy_distance(drawn * genes[:, 1:],
+                                                            batch_data["full_expr_next"].to(device)[group_rows, 1:] * genes[:, 1:],
+                                                            pair_group, group_projection)
+                        loss = loss + group_energy_weight * loss_energy
+                        metrics_to_log.update({"train/next_energy": loss_energy.item()})
 
             if "nuisance_adversary" in output_dict:
                 # The adversaries see the embedding through a gradient reversal: minimizing this

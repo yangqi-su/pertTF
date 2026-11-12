@@ -58,6 +58,49 @@ def energy_score_loss(
     return (0.5 * (d_a + d_b) - 0.5 * d_ab).mean()
 
 
+def straight_through_counts(pred: torch.Tensor, source: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Cells drawn around predicted cells from their source cells, with a straight-through gradient.
+
+    pred and source are log1p normalised expression (genes only) and sf pertTF's (cells x 1) normalisation
+    multiplier (normalised = counts x sf). On the source's raw counts x and the prediction's t, the draw is
+    Binomial(x, t / x) where t <= x (thinning, so counts can drop to 0) and x + Poisson(t - x) otherwise (a zero
+    gene switches on only sometimes); its expected count is t. The value is that draw, the gradient that of t
+    (as if the draw were t plus fixed noise), so the cells are real counts while the prediction is trained.
+    The prediction is capped at log1p 20 (~5e8 per 10,000, far above any real expression): an overflowing rate
+    can make torch.poisson loop without end (the likely cause of a training run that froze).
+    """
+    x = torch.round(torch.expm1(source.clamp(min=0)) / sf)
+    t = torch.expm1(pred.clamp(min=0, max=20)) / sf
+    with torch.no_grad():
+        thinned = torch.distributions.Binomial(total_count=x, probs=(t / x.clamp(min=1)).clamp(0, 1)).sample()
+        draw = torch.where(t <= x, thinned, x + torch.poisson((t - x).clamp(min=0)))
+    return torch.log1p((draw + t - t.detach()) * sf)
+
+
+def group_energy_distance(pred: torch.Tensor, target: torch.Tensor, groups: torch.Tensor,
+                          projection: torch.Tensor) -> torch.Tensor:
+    """Mean over groups with >= 2 cells of the energy distance between predicted and real cells after projection.
+
+    2 E||X - Y|| - E||X - X'|| - E||Y - Y'|| with unsquared norms (squared, it only compares means); it is 0 only when
+    the two distributions are equal. pred and target are (cells x genes), groups the group of each row and projection
+    (genes x k) fixed loadings, e.g. principal components. The within-set terms leave out each cell's distance to itself.
+    """
+    def distances(u, v):
+        return (u[:, None] - v[None]).pow(2).sum(-1).add(1e-8).sqrt()
+
+    a, b = pred @ projection, target @ projection
+    energies = []
+    for group in torch.unique(groups):
+        rows = groups == group
+        n = int(rows.sum())
+        if n < 2:
+            continue
+        x, y = a[rows], b[rows]
+        within = (distances(x, x).sum() + distances(y, y).sum()) / (n * (n - 1))
+        energies.append(2 * distances(x, y).mean() - within)
+    return torch.stack(energies).mean() if energies else pred.new_zeros(())
+
+
 def criterion_neg_log_bernoulli(
     input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None
 ) -> torch.Tensor:
