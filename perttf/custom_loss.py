@@ -32,6 +32,18 @@ def masked_mse_loss(
     return loss / mask.sum()
 
 
+def group_change_mse(prediction: torch.Tensor, source: torch.Tensor, group_ids: torch.Tensor,
+                     real_changes: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Reliability-weighted mean effective change; include WT denominator weights."""
+    groups, inverse = torch.unique(group_ids, return_inverse=True)
+    counts = torch.bincount(inverse).float()
+    mean_change = torch.zeros(len(groups), prediction.shape[1], device=prediction.device)
+    mean_change.index_add_(0, inverse, prediction.float() - source.float())
+    mean_change = mean_change / counts[:, None]
+    errors = (mean_change - real_changes[groups]).square().mean(1)
+    return (errors * weights[groups]).sum() / weights[groups].sum()
+
+
 def criterion_neg_log_bernoulli(
     input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None
 ) -> torch.Tensor:

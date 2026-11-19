@@ -133,6 +133,20 @@ def produce_training_datasets(adata_input, config,
                                      genotype_to_index= genotype_to_index,
                                      expr_layer= input_layer_key)
     t_data, t_loader = test_manager.get_data_w_loader(train_indices)
+    if config.get('next_decoder', 'mvc') == 'group_delta':
+        from ..utils.group_delta import ContextKOBatchSampler, fitting_group_changes
+        if effective_next_cell_pred != 'pert' or t_data.pairing.pairing_anchor != 'target':
+            raise ValueError('group_delta requires perturbation training with target-anchored pairing')
+        if not all(np.isin(rows, train_indices).all() for rows in
+                   (t_data.pairing.source_indices, t_data.pairing.target_indices)):
+            raise ValueError('group_delta pairing escaped the supplied fitting cohort')
+        groups = fitting_group_changes(test_manager.adata, train_indices, input_layer_key, control_value)
+        group_ids = groups['row_groups'][t_data.indices].numpy()
+        sampler = ContextKOBatchSampler(group_ids, len(t_loader), config.get('groups_per_batch', 8),
+                                       config.get('cells_per_group', 16), config.seed)
+        t_loader = DataLoader(t_data, batch_sampler=sampler, collate_fn=t_loader.collate_fn,
+                             num_workers=0, pin_memory=True)
+        t_loader.group_delta_targets = groups
     perturbation_validation = effective_next_cell_pred == "pert"
     valid_control_indices = np.array([], dtype=np.int64)
     valid_target_indices = np.array([], dtype=np.int64)
@@ -166,8 +180,19 @@ def produce_training_datasets(adata_input, config,
             shuffle=False,
         )
 
+    if config.get('next_decoder', 'mvc') == 'group_delta':
+        v_loader.num_workers = 0
+        v_loader.prefetch_factor = None
+
     data_info = test_manager.get_adata_info_dict()
     data_info['train_loader'] = t_loader
+    if config.get('next_decoder', 'mvc') == 'group_delta':
+        data_info['group_delta_targets'] = t_loader.group_delta_targets
+        from ..utils.pert_metrics import group_moments_from_anndata
+        data_info['perturbation_reference_groups'] = group_moments_from_anndata(
+            test_manager.adata, valid_indices, layer=input_layer_key, normalize=False,
+            perturbation_unit=config.get('perturbation_unit', 'set'),
+            pert_delimiter=config.get('pert_delimiter'), control_value=control_value).finalize()
     data_info['valid_loader'] = v_loader
     data_info['train_data'] = t_data
     data_info['valid_data'] = v_data

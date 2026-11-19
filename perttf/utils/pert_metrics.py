@@ -70,20 +70,25 @@ def group_moments_from_anndata(
     perturbation_unit="set",
     pert_delimiter=None,
     control_value="WT",
+    normalize=True,
 ):
-    """Build normalized group moments from selected AnnData rows.
+    """Build group moments from selected AnnData rows.
 
     With ``perturbation_unit="single"`` each cell contributes to one group per
-    component perturbation.
+    component perturbation. ``normalize=False`` preserves stored expression,
+    for models whose targets and predictions already share that space.
     """
     indices = np.asarray(indices, dtype=np.int64)
     moments = GroupMoments()
     matrix = adata.X if layer is None else adata.layers[layer]
     for start in range(0, indices.size, chunk_size):
         chunk = indices[start : start + chunk_size]
-        values = normalize_expression(
-            matrix[chunk], target_sum=target_sum, input_scale=input_scale
-        )
+        if normalize:
+            values = normalize_expression(matrix[chunk], target_sum=target_sum, input_scale=input_scale)
+        else:
+            # Group-delta targets and predictions are already in stored log1p space.
+            values = matrix[chunk]
+            values = values.toarray() if sparse.issparse(values) else np.asarray(values)
         contexts = adata.obs.iloc[chunk][context_col].to_numpy()
         perturbations = adata.obs.iloc[chunk][perturbation_col].to_numpy()
         values, contexts, perturbations = expand_perturbation_rows(

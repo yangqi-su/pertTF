@@ -36,6 +36,7 @@ class PerturbationTFModel(BaseModel):
         self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
         self.pert_dim = kwargs.pop('pert_dim', None)
         self.pert_aggregation = kwargs.pop('pert_aggregation', 'sum')
+        self.next_decoder = kwargs.pop('next_decoder', 'mvc')
         # optional perturbation FEATURE matrix (n_pert, feat_dim). When provided, the
         # perturbation encoder maps each genotype index through its feature vector + an
         # MLP instead of an independent lookup row, so novel (unseen-in-training)
@@ -198,6 +199,8 @@ class PerturbationTFModel(BaseModel):
         PSPRED: bool = False,
         mvc_src: Tensor = None,
         pert_embeddings_next: Optional[Tensor] = None,
+        source_values: Optional[Tensor] = None,
+        delta_gene_ids: Optional[Tensor] = None,
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -313,7 +316,7 @@ class PerturbationTFModel(BaseModel):
                 dim=1,
             )
             #tf_concat = cell_emb_orig + pert_emb_next
-            cell_emb_next=self.pert_exp_encoder(tf_concat)
+            cell_emb_next=cell_emb_orig if self.next_decoder == 'group_delta' else self.pert_exp_encoder(tf_concat)
             output["contrastive_dict"]['next_emb0'] = cell_emb_next
         else:
             tf_concat = None # add a placeholder
@@ -322,6 +325,10 @@ class PerturbationTFModel(BaseModel):
         cell_emb = cell_emb_orig
         output["cell_emb"] = cell_emb
         output["cell_emb_next"] = cell_emb_next
+        if self.next_decoder == 'group_delta' and (pert_labels_next is not None or pert_embeddings_next is not None):
+            if source_values is None or delta_gene_ids is None:
+                raise ValueError('group_delta requires unmasked source_values and ordered delta_gene_ids (without CLS)')
+            output.update(self.delta_decoder(cell_emb, pert_emb_next, self.encoder(delta_gene_ids), source_values))
 
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
@@ -354,6 +361,12 @@ class PerturbationTFModel(BaseModel):
             else:
                 output["mvc_output"] = mvc_output  # (batch, seq_len)
                 output["mvc_output_next"] = mvc_output_next  # (batch, seq_len)
+            if 'delta_prediction' in output:
+                # Next-cell expression has its own scale; source MVC remains NB.
+                delta = output['delta_prediction']
+                next_expression = torch.cat([delta.new_zeros(len(delta), 1), delta], dim=1)
+                output['mvc_output_next'] = dict(pred=next_expression,
+                    distribution=None, param2=None, zero_probs=torch.ones_like(next_expression))
 
         if ECS and hasattr(self, 'sim'):
             # Here using customized cosine similarity instead of F.cosine_similarity

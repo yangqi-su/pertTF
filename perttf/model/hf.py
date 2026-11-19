@@ -76,6 +76,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         distribution: Optional[str] = None,
         pert_sources: Optional[Dict] = None,
         control_label: str = "WT",
+        next_decoder: str = "mvc",
+        delta_rank: int = 64,
         **kwargs
     ):
         # 1. Handle Training Config & Extras
@@ -180,6 +182,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             pert_dim=pert_dim,
             pert_aggregation=pert_aggregation,
             pert_features=self.pert_features,
+            next_decoder=next_decoder,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
 
@@ -192,6 +195,11 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 self.d_model if pert_dim is None else pert_dim,
                 padding_idx=pert_pad_id, control_label=control_label,
             )
+
+        if next_decoder == 'group_delta':
+            self.enable_group_delta(delta_rank)
+        elif next_decoder != 'mvc':
+            raise ValueError("next_decoder must be 'mvc' or 'group_delta'")
 
         # 4. SANITIZE HF CONFIG
         # The Mixin automatically captured EVERYTHING in __init__ into self.config.
@@ -221,6 +229,29 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         self.vocab = vocab
         self.training_config.update(self._hub_mixin_config)
         self.training_config = OmegaConf.create(self.training_config)
+
+    def enable_group_delta(self, rank: int = 64):
+        """Adapt a loaded model: fresh zero-response head, copied source MVC gene decoder.
+
+        Call once after strict loading of a legacy checkpoint and before creating
+        the optimizer. Scratch models can instead set next_decoder='group_delta'.
+        """
+        from .pert_encoder import UnifiedPertEncoder
+        from .group_delta import GroupDeltaDecoder
+        if hasattr(self, 'delta_decoder'):
+            raise ValueError('Group delta head already exists; refusing to reset its learned weights')
+        if not isinstance(self.pert_encoder, UnifiedPertEncoder):
+            raise ValueError('group_delta requires unified perturbation features with a fixed-zero control')
+        if self.pert_encoder.padding_idx != self.genotype_to_index[self.pert_encoder.control_label]:
+            raise ValueError('group_delta requires a fixed-zero control embedding')
+        if self.distribution != 'nb' or self.use_batch_labels or self.mvc_decoder.arch_style != 'inner product':
+            raise ValueError('group_delta supports batch-label-free NB source reconstruction with inner-product MVC')
+        self.pert_exp_encoder = torch.nn.Identity()
+        self.delta_decoder = GroupDeltaDecoder(self, rank).to(next(self.parameters()).device)
+        self.next_decoder = 'group_delta'
+        self._hub_mixin_config.update(next_decoder='group_delta', delta_rank=rank)
+        self.training_config.update(next_decoder='group_delta', delta_rank=rank)
+        return self
 
     def save_pretrained(self, save_directory: str, training_config: Optional[Dict] = None, **kwargs):
         super().save_pretrained(save_directory, **kwargs)
@@ -265,6 +296,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
     @property
     def prediction_scale(self) -> str:
         """Native scale returned by the expression distribution generator."""
+        if self.next_decoder == 'group_delta':
+            return 'log1p'
         distribution = getattr(self, "distribution", None)
         return "log1p" if distribution in {None, "zig", "gaussian"} else "counts"
 
@@ -336,6 +369,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         control_value = resolve_control_value(self.training_config)
+        if self.next_decoder == 'group_delta' and not adata.obs['genotype'].eq(control_value).all():
+            raise ValueError('group_delta prediction requires observed control source cells')
+        if self.next_decoder == 'group_delta' and prediction_mode == 'sample' and not use_size_factor:
+            raise ValueError('group_delta count sampling requires source size factors')
         observed_labels = pd.concat([adata.obs["genotype"], adata.obs[perturbation_col]]).dropna().astype(str).unique()
         validate_perturbation_labels(observed_labels, pert_delimiter, control_value,
                                      existing_mapping=self.genotype_to_index)
@@ -489,6 +526,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "perturbation_col": perturbation_col,
             "prediction_mode": prediction_mode,
             "prediction_seed": prediction_seed,
+            "next_decoder": self.next_decoder,
             "gene_sampling_mode": str(config.sampling_mode),
             "max_seq_len": int(config.max_seq_len),
             "pert_delimiter": pert_delimiter,
@@ -1009,6 +1047,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         settings["GEPC"] = hasattr(self, "mvc_decoder")
         settings["explicit_zero_prob"] = bool(self.explicit_zero_prob)
         settings["distribution"] = self.distribution
+        settings["next_decoder"] = self.next_decoder
         config, run = generate_config(settings, wandb_mode=wandb_mode)
 
         # Classifier heads and the perturbation encoder index the model's own label dictionaries.
@@ -1041,6 +1080,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             work_dir = Path(save_dir) / "wrapper_train" if save_dir else Path(tmp_dir)
             work_dir.mkdir(parents=True, exist_ok=True)
             best_model = train_function.wrapper_train(self, config, data_gen, save_dir=work_dir, device=device)
+            if save_dir and self.next_decoder == 'group_delta':
+                # wrapper_train leaves self at the final epoch; restore best only after export.
+                config.update({'checkpoint_selection': self.checkpoint_selection}, allow_val_change=True)
+                self.save_pretrained(Path(save_dir) / 'hf_final_model', training_config=config.as_dict())
         self.load_state_dict(best_model.state_dict())
         self.training_config = OmegaConf.create({k: v for k, v in config.as_dict().items() if not k.startswith("_")})
         if run is not None:

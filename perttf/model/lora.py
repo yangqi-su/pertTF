@@ -12,8 +12,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from anndata import AnnData
-from peft import get_peft_model
-from peft.tuners.tuners_utils import BaseTunerLayer
 
 from . import train_function
 from ..custom_loss import GenerativeExpressionLoss, criterion_neg_log_bernoulli, masked_mse_loss
@@ -23,6 +21,7 @@ from ..utils.pert_labels import unique_perturbations
 
 def check_no_adapter(model) -> None:
     """One adapter per loaded model: training a second adapter would wrap an already-wrapped model."""
+    from peft.tuners.tuners_utils import BaseTunerLayer
     if any(isinstance(module, BaseTunerLayer) for module in model.modules()):
         raise ValueError(
             "This model already has a LoRA adapter attached. Load a fresh base model with "
@@ -133,6 +132,7 @@ def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sourc
 
 
 def wrap(model, lora_config, config, device: torch.device, num_batch_types: int):
+    from peft import get_peft_model
     """Wrap the model with LoRA and build its optimizer: always AdamW with the per-epoch StepLR."""
     model.to(device)
     peft_model = get_peft_model(model, lora_config).to(device)

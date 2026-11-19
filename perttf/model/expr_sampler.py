@@ -1,5 +1,34 @@
 import torch
+import numpy as np
 import torch.nn.functional as F
+
+
+def sample_source_counts(source_log, prediction_log, sf, rng):
+    """Thin source counts or add Poisson counts; retain pertTF's inverse size factor.
+
+    Inputs/outputs are log1p-normalized expression; raw counts = expm1(log)/sf.
+    sf must represent the original source normalization, not a new row total.
+    The minimum-nonzero estimator assumes a retained count-one gene. Prefer a
+    supplied size_factor_col when independently recorded factors are available.
+    """
+    source_log = np.asarray(source_log)
+    prediction_log = np.asarray(prediction_log)
+    sf = np.asarray(sf, dtype=np.float64).reshape(-1, 1)
+    if not np.isfinite(sf).all() or (sf <= 0).any():
+        raise ValueError('Count sampling requires finite positive source size factors')
+    recovered = np.expm1(source_log.astype(np.float64)) / sf
+    if np.max(np.abs(recovered - np.rint(recovered))) > .05:
+        raise ValueError('Source expression and size factors do not recover integer counts')
+    source_counts = np.rint(recovered).astype(np.int64)
+    target_counts = np.expm1(prediction_log.astype(np.float64)) / sf
+    unchanged = prediction_log == source_log
+    target_counts = np.where(unchanged, source_counts, target_counts)
+    probability = np.minimum(target_counts / np.maximum(source_counts, 1), 1)
+    thinned = rng.binomial(source_counts, probability)
+    added = rng.poisson(np.maximum(target_counts - source_counts, 0))
+    counts = np.where(target_counts <= source_counts, thinned, source_counts + added)
+    sampled = np.log1p(counts * sf).astype(np.float32)
+    return np.where(unchanged, source_log, sampled).astype(np.float32)
 
 
 def _sample_zig(mu, theta, pi, sample=False, to_counts=False, sf=None):

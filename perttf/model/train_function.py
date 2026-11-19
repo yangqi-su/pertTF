@@ -34,6 +34,7 @@ from ..custom_loss import (
     GenerativeExpressionLoss,
     perturbation_classification_loss,
     perturbation_overlap_mask,
+    group_change_mse,
 )
 from ..utils.plot import process_and_log_umaps
 from ..utils.misc import append_tensor as _append_tensor
@@ -53,7 +54,7 @@ from ..utils.pert_metrics import (
     prediction_scale,
     resolve_checkpoint_score,
 )
-from .expr_sampler import DistributionGenerator
+from .expr_sampler import DistributionGenerator, sample_source_counts
 
 
 def _cce_labels(contrastive_dict, labels, labels_next):
@@ -113,6 +114,9 @@ def train(model: nn.Module,
         ps_next_training_weight = config.ps_weight * config.next_weight
 
     num_batches = len(loader)
+    group_delta = getattr(model, 'next_decoder', 'mvc') == 'group_delta'
+    if group_delta:
+        group_targets = {key: value.to(device) for key, value in loader.group_delta_targets.items()}
     for batch, batch_data in enumerate(loader):
         input_gene_ids = batch_data["gene_ids"].to(device)
         input_values = batch_data["values"].to(device)
@@ -127,6 +131,10 @@ def train(model: nn.Module,
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
 
         mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
+        delta_kwargs = {}
+        if group_delta:
+            delta_kwargs = dict(source_values=batch_data['full_expr'][:, 1:].to(device),
+                                delta_gene_ids=batch_data['full_gene_ids'][:, 1:].to(device))
         if config.ps_weight >0:
             ps_score = batch_data["ps"].to(device)
             ps_score_next = batch_data["ps_next"].to(device) #
@@ -150,7 +158,8 @@ def train(model: nn.Module,
                 CCE = config.CCE,
                 PERTPRED = config.get('genotype_classifier', True),
                 PSPRED = config.ps_weight >0,
-                mvc_src = mvc_src
+                mvc_src = mvc_src,
+                **delta_kwargs,
             )
 
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
@@ -236,12 +245,18 @@ def train(model: nn.Module,
                 loss = loss + config.this_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
-                loss_gepc_next = criterion_mvc(
-                    output_dict["mvc_output_next"], 
-                    mvc_target_values_next,
-                    mvc_next_masked_positions,
-                    scale_factor = sf_next,
-                )
+                if group_delta:
+                    group_ids = group_targets['row_groups'][batch_data['next_index'].long().to(device)]
+                    loss_gepc_next = group_change_mse(output_dict['delta_prediction'], delta_kwargs['source_values'],
+                        group_ids, group_targets['changes'], group_targets['weights'])
+                    metrics_to_log['train/group_change_mse'] = loss_gepc_next.item()
+                else:
+                    loss_gepc_next = criterion_mvc(
+                        output_dict["mvc_output_next"],
+                        mvc_target_values_next,
+                        mvc_next_masked_positions,
+                        scale_factor = sf_next,
+                    )
                 loss = loss + config.next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
                 
@@ -492,6 +507,8 @@ def _run_evaluation_batches(
     criterion_ps = nn.MSELoss()
     criterion_mvc = GenerativeExpressionLoss()
     generator = DistributionGenerator(getattr(model, "distribution", None))
+    group_delta = getattr(model, 'next_decoder', 'mvc') == 'group_delta'
+    count_rng = np.random.default_rng(sample_seed)
     prediction_only = getattr(loader.dataset, "prediction_only", False)
     has_targets = not prediction_only
     collect_outputs = prediction_only
@@ -551,6 +568,9 @@ def _run_evaluation_batches(
             mvc_src = batch_data["full_gene_ids"].to(device) if (perturbation_validation or use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
             perturbation_kwargs = {}
+            if group_delta:
+                perturbation_kwargs.update(source_values=batch_data['full_expr'][:, 1:].to(device),
+                                           delta_gene_ids=batch_data['full_gene_ids'][:, 1:].to(device))
             if perturbation_embeddings is not None and perturbation_labels_next is not None:
                 if perturbation_labels_next.dim() == 2:
                     # (batch, k, dim); the model reduces it with pert_labels_next, which masks the -1 pads
@@ -595,10 +615,14 @@ def _run_evaluation_batches(
                             output_dict["mvc_output"], mvc_target_values,
                             mask=None if source_mask is None else source_mask.to(device), scale_factor=sf,
                         )
-                        loss_gepc_next = criterion_mvc(
-                            output_dict["mvc_output_next"], mvc_target_values_next,
-                            mask=None if target_mask is None else target_mask.to(device), scale_factor=sf_next,
-                        )
+                        if group_delta:
+                            loss_gepc_next = torch.nn.functional.mse_loss(
+                                output_dict['delta_prediction'], batch_data['full_expr_next'][:, 1:].to(device))
+                        else:
+                            loss_gepc_next = criterion_mvc(
+                                output_dict["mvc_output_next"], mvc_target_values_next,
+                                mask=None if target_mask is None else target_mask.to(device), scale_factor=sf_next,
+                            )
                     else:
                         loss_gepc = output_values.new_tensor(0.0)
                         loss_gepc_next = output_values.new_tensor(0.0)
@@ -621,6 +645,13 @@ def _run_evaluation_batches(
                 total_ps += loss_ps.item() * batch_size
                 total_ps_next += loss_ps_next.item() * batch_size
 
+            delta_expression = None
+            if group_delta and (perturbation_validation or predict_expr):
+                delta_expression = _to_numpy(output_dict['delta_prediction'])
+                if expr_prediction_mode == 'sample':
+                    delta_expression = sample_source_counts(_to_numpy(perturbation_kwargs['source_values']),
+                        delta_expression, _to_numpy(batch_data['sf']), count_rng)
+
             if perturbation_validation:
                 assert moments is not None
                 contexts = labels_to_names(batch_data["celltype_labels"], index_to_celltype)
@@ -629,18 +660,21 @@ def _run_evaluation_batches(
                     perturbations = np.asarray(batch_data["pert_name_next"])
                 else:
                     perturbations = labels_to_names(batch_data["perturbation_labels_next"], index_to_genotype)
-                predicted = generator.generate(
-                    output_dict["mvc_output_next"],
-                    sample=expr_prediction_mode == "sample",
-                    device=device,
-                )["pred"][:, 1:]
-                if hasattr(loader, "metric_gene_mask"):
-                    predicted = predicted[:, torch.as_tensor(loader.metric_gene_mask, device=device)]
-                normalized = normalize_expression(
-                    _to_numpy(predicted),
-                    target_sum=target_sum,
-                    input_scale=prediction_scale(getattr(model, "distribution", None)),
-                )
+                if group_delta:
+                    normalized = delta_expression
+                else:
+                    predicted = generator.generate(
+                        output_dict["mvc_output_next"],
+                        sample=expr_prediction_mode == "sample",
+                        device=device,
+                    )["pred"][:, 1:]
+                    if hasattr(loader, "metric_gene_mask"):
+                        predicted = predicted[:, torch.as_tensor(loader.metric_gene_mask, device=device)]
+                    normalized = normalize_expression(
+                        _to_numpy(predicted),
+                        target_sum=target_sum,
+                        input_scale=prediction_scale(getattr(model, "distribution", None)),
+                    )
                 normalized, contexts, perturbations = expand_perturbation_rows(
                     normalized, contexts, perturbations,
                     _cfg(config, "pert_delimiter", None),
@@ -661,6 +695,9 @@ def _run_evaluation_batches(
                 if predict_expr:
                     _append_tensor(outputs, "mlm_expr", output_dict.get("mlm_output")[:, 1:])
                     for prefix, expr_output in (("mvc", output_dict["mvc_output"]), ("mvc_next", output_dict["mvc_output_next"])):
+                        if group_delta and prefix == 'mvc_next':
+                            outputs.setdefault('mvc_next_expr', []).append(delta_expression)
+                            continue
                         generated = generator.generate(expr_output, sample=expr_prediction_mode == "sample", device=device)
                         outputs.setdefault(f"{prefix}_expr", []).append(_to_numpy(generated["pred"][:, 1:]))
                         if generated.get("zero_probs") is not None:
@@ -922,6 +959,9 @@ def wrapper_train(model, config, data_gen,
     vocab = data_gen['vocab']
 
     train_loader, valid_loader = data_gen['train_loader'], data_gen['valid_loader']
+    group_delta = getattr(model, 'next_decoder', 'mvc') == 'group_delta'
+    if group_delta != (config.get('next_decoder', 'mvc') == 'group_delta'):
+        raise ValueError('Model and training config disagree on the next-cell decoder')
     optimizer_dict = create_optimizer_dict(model, device, config, num_batch_types,
                                            steps_per_epoch=len(train_loader))
     best_val_score = None
@@ -991,7 +1031,12 @@ def wrapper_train(model, config, data_gen,
         )
     evaltest_processes = []
 
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(0 if group_delta else 1, config.epochs + 1):
+        if group_delta:
+            random.seed(config.seed + epoch)
+            np.random.seed(config.seed + epoch)
+            torch.manual_seed(config.seed + epoch)
+            train_loader.batch_sampler.epoch = epoch
         if hasattr(train_loader, "set_epoch"):
             train_loader.set_epoch(epoch)
         epoch_start_time = time.time()
@@ -1015,7 +1060,7 @@ def wrapper_train(model, config, data_gen,
         evaltest_processes = remaining_processes
         logger.info(f"Active UMAP processes: {len( evaltest_processes)}")
 
-        if config.do_train:
+        if config.do_train and epoch > 0:
             train(
                 model,
                 train_loader,
@@ -1113,6 +1158,7 @@ def wrapper_train(model, config, data_gen,
             best_val_score = loss
             best_model = copy.deepcopy(model)
             best_model_epoch = epoch
+            selected_epoch = epoch
             if logger is not None:
                 logger.info(f"Best model with {checkpoint_metric} ({checkpoint_mode}) score {best_val_score:5.4f}")
 
@@ -1171,7 +1217,7 @@ def wrapper_train(model, config, data_gen,
             wandb.log({"test/best_model_epoch":best_model_epoch})
             # wandb.log({"avg_bio": results.get("avg_bio", 0.0)})
 
-        if optimizer_dict['scheduler_interval'] == 'epoch':
+        if optimizer_dict['scheduler_interval'] == 'epoch' and epoch > 0:
             optimizer_dict['scheduler'].step()
 
         if optimizer_dict['DAB_separate_optim']:
@@ -1197,5 +1243,10 @@ def wrapper_train(model, config, data_gen,
                 remaining_processes.append(p)
     # save the best model
     torch.save(best_model.state_dict(), save_dir / "best_model.pt")
+    if group_delta:
+        torch.save(model.state_dict(), save_dir / 'final_model.pt')
+        model.checkpoint_selection = dict(selected_epoch=selected_epoch, final_epoch=config.epochs,
+                                          validation_score=float(best_val_score), metric=checkpoint_metric)
+        best_model.checkpoint_selection = model.checkpoint_selection
 
     return best_model

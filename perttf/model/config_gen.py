@@ -69,6 +69,14 @@ def generate_config(parameter_dict,
     parameter_dict['pert_pred_threshold'] = parameter_dict.get('pert_pred_threshold', 0.5)
     parameter_dict['pert_bce_pos_weight'] = parameter_dict.get('pert_bce_pos_weight', None)
     parameter_dict['max_perts_per_cell'] = parameter_dict.get('max_perts_per_cell', None)
+    parameter_dict['next_decoder'] = parameter_dict.get('next_decoder', 'mvc')
+    if parameter_dict['next_decoder'] == 'group_delta':
+      parameter_dict['groups_per_batch'] = parameter_dict.get('groups_per_batch', 8)
+      parameter_dict['cells_per_group'] = parameter_dict.get('cells_per_group', 16)
+      if parameter_dict['batch_size'] != parameter_dict['groups_per_batch'] * parameter_dict['cells_per_group']:
+        raise ValueError('group_delta batch_size must equal groups_per_batch * cells_per_group')
+      if not parameter_dict.get('append_cls', True):
+        raise ValueError('group_delta uses full expression with a leading CLS column')
     if parameter_dict['next_cell_pred_type'] == 'identity':
       parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
