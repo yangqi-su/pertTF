@@ -10,7 +10,9 @@ Same-celltype pairing (source and target share a cell type):
   P2  WT -> KO, other-background target                (KO effect in e.g. HUES8 targets)
   P3  WT -> WT, background switch, same day            (background offset, e.g. clone 111)
   P5  every group with itself ("self")                 (reconstruction only)
-  P6  WT -> WT, pool switch, same day and background   (pool offset)
+  P6  WT -> WT, pool switch, same day and background   (pool offset; any day with p6_same_day=False)
+  P7  WT of another pool -> KO, same background        (KO effect plus the pool shift, e.g. HUES8, whose WT is only
+                                                        external; not in the default rules)
 Development pairing (target cell type is an outcome, not matched):
   D1  WT at the origin day -> KO at a later day         (KO applied at origin; the deployable query)
   D3  KO A -> KO A at a later day, reference background (the KO's own trajectory)
@@ -39,7 +41,7 @@ def same_celltype_pairs(
     groups: Groups, *, perturbation: str, celltype: str, background: str, pool: str, day: str,
     control: str, reference_background: str, reference_pool: str,
     source_backgrounds: list[str] | None = None, exclude_target_celltypes: tuple[str, ...] = (),
-    rules: tuple[str, ...] = ("P1", "P2", "P3", "P5", "P6"),
+    rules: tuple[str, ...] = ("P1", "P2", "P3", "P5", "P6"), p6_same_day: bool = True,
 ) -> pl.DataFrame:
     """Pairs within one cell type. ``source_backgrounds``: backgrounds of WT sources for KO pairs
     (default: every background); ``exclude_target_celltypes``: cell types never used as KO targets (ESC)."""
@@ -57,8 +59,9 @@ def same_celltype_pairs(
         "P3": lambda: _rule(cross(groups, on=[celltype, day, pool], source=is_ctrl & in_ref_pool, target=is_ctrl & in_ref_pool)
                             .filter(src[background] != tgt[background]), "P3", "random"),
         "P5": lambda: _rule(cross(groups, on=groups.by), "P5", "self"),
-        "P6": lambda: _rule(cross(groups, on=[celltype, day, background], source=is_ctrl, target=is_ctrl)
-                            .filter(src[pool] != tgt[pool]), "P6", "random"),
+        "P6": lambda: _rule(cross(groups, on=[celltype, day, background] if p6_same_day else [celltype, background],
+                                  source=is_ctrl, target=is_ctrl).filter(src[pool] != tgt[pool]), "P6", "random"),
+        "P7": lambda: _rule(cross(groups, on=[celltype, background], source=is_ctrl & ~in_ref_pool, target=ko_target), "P7", "random"),
     }
     return combine(*(branches[name]() for name in rules))
 

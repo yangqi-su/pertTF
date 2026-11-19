@@ -192,3 +192,68 @@ def encode_perturbation_set(encoder: nn.Module, labels: Tensor, aggregation: str
         return encoder(labels)
     emb = encoder(labels.clamp_min(0))
     return reduce_perturbation_embeddings(emb, labels, aggregation)
+
+
+class KnockoutLookup(nn.Module):
+    """A knockout's representation as a weighted average of learned codes: one per table knockout (those with training
+    targets) and one "no match" code. Weights are a softmax over [no-match score, sharpness * cos(query, table key)],
+    with query and keys the base encoder's embeddings. In training, each knockout present in a batch is hidden from its
+    own table row with probability hide, so the sharpness, the no-match score and code learn how to represent a knockout
+    that has no row; at evaluation a table knockout finds its own row and any other knockout has none.
+    With self_bonus, a knockout's own row also gets a learned bonus delta added to its score, so a table knockout can
+    find itself whatever the sharpness: the learned projection can place an unseen knockout as close to a table
+    knockout as that knockout is to itself (MODELLING_DISCUSSION.md section 61), which cos alone cannot tell apart.
+    With hard_identity, a table knockout that is not hidden is represented by exactly its own code, and the weighted
+    average (which then never includes the knockout's own row) serves only hidden knockouts and knockouts without a row.
+    """
+
+    def __init__(self, table: list, n_pert: int, dim: int, hide: float, self_bonus: bool = False,
+                 hard_identity: bool = False):
+        super().__init__()
+        self.register_buffer("table", torch.as_tensor(table, dtype=torch.long))
+        row = torch.full((n_pert,), -1, dtype=torch.long)
+        row[self.table] = torch.arange(len(table))
+        self.register_buffer("row_of", row)
+        # Unit-scale codes, like the base encoder's LayerNorm output; the no-match code starts at 0 (no knockout effect).
+        self.codes = nn.Parameter(torch.randn(len(table), dim))
+        self.null_code = nn.Parameter(torch.zeros(dim))
+        self.null_score = nn.Parameter(torch.zeros(()))
+        self.log_sharpness = nn.Parameter(torch.tensor(2.0))   # sharpness e^2 ~ 7.4
+        self.self_bonus = nn.Parameter(torch.tensor(2.0)) if self_bonus else None
+        self.hard_identity = hard_identity
+        self.hide = hide
+
+    def hidden(self, labels: Tensor) -> Tensor:
+        """(batch,) bool: the pair's knockout is hidden from its own row in this training step (all pairs of a knockout
+        together, each table knockout present with probability hide); all False at evaluation."""
+        own = self.row_of[labels]
+        if not (self.training and self.hide > 0):
+            return torch.zeros_like(own, dtype=torch.bool)
+        present = torch.unique(labels[own >= 0])
+        return torch.isin(labels, present[torch.rand(len(present), device=labels.device) < self.hide])
+
+    def weights(self, query: Tensor, keys: Tensor, labels: Tensor, exclude_own: Optional[Tensor] = None) -> Tensor:
+        """(batch, 1 + table) softmax weights; column 0 is the no-match code. Rows with exclude_own (default: hidden)
+        get no weight on their own row."""
+        sim = torch.exp(self.log_sharpness) * nn.functional.normalize(query, dim=-1) @ nn.functional.normalize(keys, dim=-1).T
+        own = self.row_of[labels]
+        if self.self_bonus is not None:
+            is_own = nn.functional.one_hot(own.clamp(min=0), len(self.table)) * (own >= 0).unsqueeze(1)
+            sim = sim + self.self_bonus * is_own
+        scores = torch.cat([self.null_score.expand(len(query), 1), sim], dim=1)
+        if exclude_own is None:
+            exclude_own = self.hidden(labels)
+        rows = torch.nonzero(exclude_own & (own >= 0)).squeeze(1)
+        scores[rows, 1 + own[rows]] = float("-inf")
+        return torch.softmax(scores, dim=1)
+
+    def forward(self, query: Tensor, keys: Tensor, labels: Tensor) -> Tensor:
+        hidden = self.hidden(labels)
+        if not self.hard_identity:
+            w = self.weights(query, keys, labels, exclude_own=hidden)
+            return w[:, :1] * self.null_code + w[:, 1:] @ self.codes
+        own = self.row_of[labels]
+        w = self.weights(query, keys, labels, exclude_own=own >= 0)
+        blend = w[:, :1] * self.null_code + w[:, 1:] @ self.codes
+        use_own = (own >= 0) & ~hidden
+        return torch.where(use_own.unsqueeze(1), self.codes[own.clamp(min=0)], blend)

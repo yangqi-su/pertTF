@@ -151,9 +151,63 @@ def train(model: nn.Module,
     # proportional to 1/n_source + 1/n_target (cells per group); half the knockout groups of a cell type have
     # fewer than ~30 cells, so each (source group, target group) is weighted by 1 / (1/n_source + 1/n_target).
     group_weight = config.get("next_group_loss_weight", 0.0)
+    # next_group_delta (model with GroupDeltaDecoder, group means as log1p of mean normalised counts): the group loss
+    # compares changes of log1p of group means on the count scale, log1p(mean predicted cell) - log1p(mean source cell)
+    # over a group's pairs in the batch, which is exact for those cells, with the real change between the groups' full
+    # means. Only knockout targets of the source's own background and pool enter (the change is measured within a
+    # batch; a control target's change is 0 by construction). next_group_interaction_weight is an L2 penalty on the
+    # head's interaction term, so that the overall, context and perturbation terms explain what they can.
+    # next_group_delta_mean "group": the predicted change is instead read from the group's full WT mean (the source group's
+    # entry of the group means) and the head's change D averaged over the group's pairs: D where D > 0, else
+    # log1p(mean_WT e^D) - log1p(mean_WT). With the ~1.6 source cells a group has in a batch, a gene with 0 counts in all of
+    # them gives a negative D no gradient ("batch", section 50 of the study notes); the full WT mean is non-zero for nearly
+    # every gene.
+    group_delta = config.get("next_group_delta", False)
+    group_delta_mean = config.get("next_group_delta_mean", "batch")
+    # next_group_delta_mean "direct" (with a wt_rule head, whose D is the change of log1p of the group mean in both
+    # directions): the predicted group change is D itself, averaged over the group's pairs; no cell enters.
+    # next_group_term_weight: L2 penalty on the other three terms (mu, alpha, beta), so that directions the group loss does
+    # not constrain (a decrease of a gene with 0 counts in the sources; the constant mu and the knockouts' beta can trade)
+    # settle at their smallest values instead of drifting (section 51 of the study notes).
+    term_weight = config.get("next_group_term_weight", 0.0)
+    # next_group_term_penalised: which terms that penalty covers. Leaving mu out makes it an unpenalised intercept: the part
+    # shared by all contexts or all knockouts moves into mu, and alpha and beta keep only shrunken deviations, so a new
+    # context or knockout falls back to the average (section 56).
+    term_names = tuple(config.get("next_group_term_penalised", ("mu", "alpha", "beta")))
+    # next_group_delta_mean "reference" (shift_rule head, section 66 of the study notes): the predicted group change is the
+    # pair's average D added to every training WT cell of the source group and floored at 0, as the head does to its
+    # sources (floored_change), so training sees the decreases the floor cuts short. With the model's decoder_terms, the
+    # loss also takes pairs within one line from the external to the knockout pool (WT or KO targets), whose pool shift
+    # the head's S term carries, and the unknown-knockout loss keeps only sources of the reference line and pool.
+    # next_group_direct_weight (with "reference"): adds that weight times the "direct" loss, (average D - real change)^2,
+    # to the group and unknown-knockout losses. Below the floor the floored change is flat in D (a gene at 0 in all WT
+    # cells gets no gradient), so D can drift negative and predict no change for genes that switch on; the direct term
+    # always pulls D toward the real change (section 67 of the study notes).
+    direct_weight = config.get("next_group_direct_weight", 0.0)
+    # next_group_shrink_weight (model with the unknown knockout): L2 penalty on the knockout part of each pair's change (D
+    # without the line and pool terms) minus the change the same cell gets with the unknown knockout (held fixed), over
+    # KO-target pairs of the group loss: pulls each knockout toward the model's average knockout in that cell, as the
+    # decomposed head's penalties pull toward mu + alpha (section 73 of the study notes; for the one-network head).
+    shrink_weight = config.get("next_group_shrink_weight", 0.0)
+    interaction_weight = config.get("next_group_interaction_weight", 0.0)
+    # next_unknown_weight (model with pert_seen and context_avg_change): squared error between the change D the head gives
+    # every WT source with the unknown-knockout embedding, averaged over a cell type's sources in the batch, and that cell
+    # type's average knockout change; the unknown knockout then learns each cell type's average knockout (section 62).
+    unknown_weight = config.get("next_unknown_weight", 0.0)
     if group_weight > 0:
         group_means = {k: v.to(device) if torch.is_tensor(v) else v for k, v in loader.next_group_means.items()}
         group_control_id = model.genotype_to_index[resolve_control_value(config)]
+    batch_terms = getattr(model, "nuisance_spec", {}).get("decoder_terms", False)
+    if batch_terms:
+        reference_line, reference_pool = (model.nuisance_spec["reference"][n] for n in ("background", "pool"))
+    if group_delta_mean == "reference":
+        cell_start, cell_count = group_means["cell_start"].tolist(), group_means["cell_count"].tolist()
+
+    def floored_change(D: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
+        """Change of each source group's mean log1p when its row of D is added to all its stored WT cells, floored at 0."""
+        floored = [(group_means["cells"][cell_start[s]:cell_start[s] + cell_count[s]].float() + d).clamp(min=0).mean(0)
+                   for d, s in zip(D, sources.tolist())]
+        return torch.stack(floored) - group_means["means"][sources]
     # next_group_energy_weight > 0 (with the group loss): within the same (source group, target group) sets, the
     # energy distance between the predicted cells, drawn as counts around the prediction from each source cell
     # (straight_through_counts), and the real target cells, after a fixed projection (next_group_energy_projection,
@@ -217,6 +271,7 @@ def train(model: nn.Module,
                 PSPRED = config.ps_weight >0,
                 mvc_src = mvc_src,
                 mvc_src_values=None if mvc_src is None else batch_data["full_expr"].to(device),
+                celltype_labels=celltype_labels,
                 nuisance_labels=nuisance_labels,
                 nuisance_labels_next=nuisance_labels_next,
                 condition_labels=condition_labels,
@@ -407,20 +462,68 @@ def train(model: nn.Module,
                     for suffix in ("", "_next")
                 )
                 group_rows = (perturbation_labels == group_control_id) & (source_group >= 0) & (target_group >= 0)
+                if group_delta and batch_terms:
+                    label = lambda name, suffix="": batch_data[f"{name}_labels{suffix}"].to(device)
+                    pool_switch = (label("pool") != label("pool", "_next")) & (label("pool", "_next") == reference_pool)
+                    group_rows &= label("background") == label("background", "_next")
+                    group_rows &= (label("pool") == label("pool", "_next")) | pool_switch
+                    group_rows &= (perturbation_labels_next != group_control_id) | pool_switch
+                elif group_delta:
+                    group_rows &= perturbation_labels_next != group_control_id
+                    for name in group_means["names"][2:]:
+                        group_rows &= batch_data[f"{name}_labels"].to(device) == batch_data[f"{name}_labels_next"].to(device)
                 if group_rows.any():
                     genes = (batch_data["full_expr_mask"] & batch_data["full_expr_next_mask"]).to(device)[group_rows].float()
                     genes[:, 0] = 0   # the CLS slot
                     real_change = group_means["means"][target_group[group_rows]] - group_means["means"][source_group[group_rows]]
-                    residual = (output_dict["mvc_output_next"]["pred"][group_rows].float()
-                                - batch_data["full_expr"].to(device)[group_rows] - real_change) * genes
-                    pair_group = torch.unique(target_group[group_rows] * len(group_means["means"]) + source_group[group_rows], return_inverse=True)[1]
+                    pair_key, pair_group = torch.unique(target_group[group_rows] * len(group_means["means"]) + source_group[group_rows], return_inverse=True)
                     n_pairs = torch.bincount(pair_group).unsqueeze(1)
-                    mean_residual = torch.zeros(len(n_pairs), residual.shape[1], device=device).index_add_(0, pair_group, residual) / n_pairs
-                    mean_genes = torch.zeros_like(mean_residual).index_add_(0, pair_group, genes) / n_pairs
+                    group_sum = lambda x: torch.zeros(len(n_pairs), x.shape[1], device=device).index_add_(0, pair_group, x)
+                    mean_genes = group_sum(genes) / n_pairs
+                    if group_delta and group_delta_mean == "reference":
+                        D = group_sum(output_dict["mvc_output_next"]["D"][group_rows] * genes) / n_pairs
+                        change = floored_change(D, pair_key % len(group_means["means"]))
+                        direct_residual = (D - group_sum(real_change) / n_pairs) * mean_genes
+                    elif group_delta and group_delta_mean == "direct":
+                        change = group_sum(output_dict["mvc_output_next"]["D"][group_rows] * genes) / n_pairs
+                    elif group_delta and group_delta_mean == "group":
+                        D = group_sum(output_dict["mvc_output_next"]["D"][group_rows] * genes) / n_pairs
+                        mean_wt = group_sum(torch.expm1(group_means["means"][source_group[group_rows]])) / n_pairs
+                        change = torch.where(D > 0, D, torch.log1p(mean_wt * torch.exp(D.clamp(max=0))) - torch.log1p(mean_wt))
+                    elif group_delta:
+                        predicted = torch.expm1(output_dict["mvc_output_next"]["pred"][group_rows].float()) * genes
+                        source = torch.expm1(batch_data["full_expr"].to(device)[group_rows].float()).clamp(min=0) * genes
+                        change = torch.log1p(group_sum(predicted) / n_pairs) - torch.log1p(group_sum(source) / n_pairs)
+                    if group_delta:
+                        mean_residual = (change - group_sum(real_change) / n_pairs) * mean_genes
+                        gamma = output_dict["mvc_output_next"]["gamma"][group_rows]
+                        loss_gamma = (gamma.pow(2) * genes).sum() / genes.sum()
+                        loss = loss + interaction_weight * loss_gamma
+                        if term_weight > 0:
+                            head = output_dict["mvc_output_next"]
+                            loss_terms = sum((head[t][group_rows].pow(2) * genes).sum() for t in term_names) / genes.sum()
+                            loss = loss + term_weight * loss_terms
+                            metrics_to_log.update({"train/next_group_terms": loss_terms.item()})
+                        ko = perturbation_labels_next[group_rows] != group_control_id
+                        if shrink_weight > 0 and ko.any():   # a batch of only WT-target pairs (P6) has nothing to shrink
+                            head = output_dict["mvc_output_next"]
+                            knockout_part = (head["D"] - head["line"] - head["pool"])[group_rows][ko]
+                            average = output_dict["unknown_D"][group_rows][ko].detach()
+                            loss_shrink = ((knockout_part - average).pow(2) * genes[ko]).sum() / genes[ko].sum()
+                            loss = loss + shrink_weight * loss_shrink
+                            metrics_to_log.update({"train/next_group_shrink": loss_shrink.item()})
+                        metrics_to_log.update({"train/next_group_gamma": loss_gamma.item(), "train/next_group_pairs": n_pairs.float().mean().item()})
+                    else:
+                        residual = (output_dict["mvc_output_next"]["pred"][group_rows].float()
+                                    - batch_data["full_expr"].to(device)[group_rows] - real_change) * genes
+                        mean_residual = group_sum(residual) / n_pairs
                     counts = group_means["counts"]
                     pair_weight = 1 / (1 / counts[source_group[group_rows]] + 1 / counts[target_group[group_rows]])
                     weight = torch.zeros(len(n_pairs), device=device).index_add_(0, pair_group, pair_weight) / n_pairs.squeeze(1)
-                    loss_group = (weight * mean_residual.pow(2).sum(1)).sum() / (weight * mean_genes.sum(1)).sum()
+                    squared = mean_residual.pow(2)
+                    if group_delta and group_delta_mean == "reference" and direct_weight > 0:
+                        squared = squared + direct_weight * direct_residual.pow(2)
+                    loss_group = (weight * squared.sum(1)).sum() / (weight * mean_genes.sum(1)).sum()
                     loss = loss + group_weight * loss_group
                     metrics_to_log.update({"train/next_group": loss_group.item()})
                     if group_energy_weight > 0:
@@ -432,6 +535,31 @@ def train(model: nn.Module,
                                                             pair_group, group_projection)
                         loss = loss + group_energy_weight * loss_energy
                         metrics_to_log.update({"train/next_energy": loss_energy.item()})
+            if unknown_weight > 0:
+                celltypes = batch_data["celltype_labels"].to(device)
+                target = model.context_avg_change[celltypes]
+                rows = (perturbation_labels == group_control_id) & ~torch.isnan(target).any(1)
+                if batch_terms:
+                    rows &= (batch_data["background_labels"].to(device) == reference_line) & (batch_data["pool_labels"].to(device) == reference_pool)
+                if group_delta_mean == "reference":
+                    rows &= source_group >= 0
+                if rows.any():
+                    genes = batch_data["full_expr_mask"].to(device)[rows].float()
+                    genes[:, 0] = 0   # the CLS slot
+                    # With the reference loss, grouped by source group (sources of one line and pool: one per cell type).
+                    key, context = torch.unique(source_group[rows] if group_delta_mean == "reference" else celltypes[rows], return_inverse=True)
+                    n_cells = torch.bincount(context).unsqueeze(1)
+                    context_sum = lambda x: torch.zeros(len(n_cells), x.shape[1], device=device).index_add_(0, context, x)
+                    mean_genes = context_sum(genes) / n_cells
+                    D_unknown = context_sum(output_dict["unknown_D"][rows].float() * genes) / n_cells
+                    real = context_sum(target[rows] * genes) / n_cells
+                    predicted = floored_change(D_unknown, key) if group_delta_mean == "reference" else D_unknown
+                    squared = ((predicted - real) * mean_genes).pow(2)
+                    if group_delta_mean == "reference" and direct_weight > 0:
+                        squared = squared + direct_weight * ((D_unknown - real) * mean_genes).pow(2)
+                    loss_unknown = squared.sum() / mean_genes.sum()
+                    loss = loss + unknown_weight * loss_unknown
+                    metrics_to_log.update({"train/next_unknown": loss_unknown.item()})
 
             if "nuisance_adversary" in output_dict:
                 # The adversaries see the embedding through a gradient reversal: minimizing this
@@ -475,6 +603,10 @@ def train(model: nn.Module,
         if optim_dict.get('optimizer_config', {}).get('optimizer') == 'muon':
             metrics_to_log['train/lr_muon'] = optimizer.param_groups[0]['lr']
             metrics_to_log['train/lr_aux_adam'] = optimizer.param_groups[1]['lr']
+        lookup = getattr(model, 'pert_lookup', None)
+        if lookup is not None:
+            metrics_to_log['train/lookup_sharpness'] = lookup.log_sharpness.exp().item()
+            metrics_to_log['train/lookup_null_score'] = lookup.null_score.item()
         scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
@@ -731,6 +863,7 @@ def _run_evaluation_batches(
                     PSPRED=_cfg(config, "ps_weight", 0) > 0 or collect_outputs,
                     mvc_src=mvc_src,
                     mvc_src_values=None if mvc_src is None else batch_data["full_expr"].to(device),
+                    celltype_labels=celltype_labels,
                     **perturbation_kwargs,
                 )
 

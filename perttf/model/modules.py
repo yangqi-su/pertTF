@@ -1135,6 +1135,102 @@ class NextDeltaDecoder(nn.Module):
         return {"pred": pred, "param2": None, "zero_probs": torch.ones_like(pred), "distribution": None}
 
 
+
+class GroupDeltaDecoder(nn.Module):
+    """Next-cell expression from one change per gene, decomposed into an overall, a context, a perturbation and an
+    interaction term, applied to the source cell by a fixed rule.
+
+    With q_g the query read from gene g's embedding (as in NextDeltaDecoder), h the source cell's embedding and p the
+    target's perturbation embedding:
+        D_g = mu(q_g) + q_g . W_alpha h + q_g . W_beta p + q_g . W_gamma f([h, p, h * p])
+    D is a change of log1p of the group mean of normalised counts. On the source's normalised counts x (expm1 of the
+    source values) the rule
+        D > 0:   m = (x + 1) e^D - 1   (log1p(m) = log1p(x) + D; a cell with 0 counts gets e^D - 1)
+        D <= 0:  m = x e^D             (zeros stay 0)
+    keeps the mean over cells exact on the count scale when D is the same for all of them. With wt_rule, a decrease is
+    instead the scaling that lowers the group's WT mean mu (forward's wt_mean) by D on the log1p scale,
+        D <= 0:  m = r x,  r = ((mu + 1) e^D - 1) / mu, at least 0  (log1p(r mu) - log1p(mu) = D; r = 0 below -log1p(mu))
+    so that D is the change of log1p of the group mean in both directions, whatever the gene's level (with m = x e^D, D
+    is a fold change for decreases, poorly determined for low genes; section 51 of the study notes). A control target gets D = 0,
+    the cell itself. With shift_rule, D is instead a change of the group's mean log1p (the scale of the cell-level metrics)
+    and is added to every cell's log1p value, clipped at 0: pred = max(log1p(x) + D, 0) (the mean log1p moves by exactly D
+    except where clipping cuts a decrease short; section 64 of the study notes).
+    With batch_terms ({"n_lines", "n_pools", "line_reference"}), two terms for pairs that cross a line or pool are added to
+    D (section 66): Lambda = q . W_line g([e_line, h]), the target line's part shared by every knockout (0 for the
+    reference line and for control targets), and S = q . W_pool k([e_pool, h]), the shift from the source's pool to the
+    target's (0 when the pools match). Without forward's line and pool labels both are 0.
+    With single, the head is not decomposed: D = q . W_gamma f([h, p, h * p]) alone (returned as gamma; mu, alpha and beta
+    are 0), the ablation of section 69 of the study notes.
+    Every term starts at 0, so the prediction starts as the source cell. Returns pred = log1p(m) (the
+    scale of the log-normalised targets, distribution None), D and its four terms (gamma also for its penalty).
+    """
+
+    def __init__(self, d_model: int, pert_dim: int, wt_rule: bool = False, shift_rule: bool = False,
+                 batch_terms: Optional[dict] = None, single: bool = False):
+        super().__init__()
+        self.wt_rule = wt_rule
+        self.shift_rule = shift_rule
+        self.single = single
+        self.gene2query = nn.Linear(d_model, d_model)
+        self.query_activation = nn.Sigmoid()
+        if not single:
+            self.mu = nn.Linear(d_model, 1)
+            self.W_alpha = nn.Linear(d_model, d_model, bias=False)
+            self.W_beta = nn.Linear(d_model, pert_dim, bias=False)
+        self.interaction = nn.Sequential(nn.Linear(2 * d_model + pert_dim, d_model), nn.GELU(), nn.Linear(d_model, d_model))
+        self.W_gamma = nn.Linear(d_model, d_model, bias=False)
+        self.batch_terms = batch_terms
+        if batch_terms is not None:
+            self.line_emb = nn.Embedding(batch_terms["n_lines"], d_model)
+            self.pool_emb = nn.Embedding(batch_terms["n_pools"], d_model)
+            self.line_net = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
+            self.pool_net = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
+            self.W_line = nn.Linear(d_model, d_model, bias=False)
+            self.W_pool = nn.Linear(d_model, d_model, bias=False)
+        main = (self.W_gamma,) if single else (self.mu, self.W_alpha, self.W_beta, self.W_gamma)
+        for layer in main + ((self.W_line, self.W_pool) if batch_terms else ()):
+            nn.init.zeros_(layer.weight)
+        if not single:
+            nn.init.zeros_(self.mu.bias)
+
+    def forward(self, cell_emb: Tensor, pert_emb: Tensor, gene_embs: Tensor, src_values: Tensor,
+                is_control: Tensor, wt_mean: Optional[Tensor] = None, line_next: Optional[Tensor] = None,
+                pool_source: Optional[Tensor] = None, pool_next: Optional[Tensor] = None) -> Dict[str, Tensor]:
+        query = self.query_activation(self.gene2query(gene_embs))   # (batch, genes, d_model)
+        both = self.interaction(torch.cat([cell_emb, pert_emb, cell_emb * pert_emb], dim=1))
+        # q . W v = q . (v W): each term's vector is mapped first, so no (batch, genes, d_model) product per term.
+        read = lambda vector: torch.bmm(query, vector.unsqueeze(2)).squeeze(2).float()
+        gamma = read(both @ self.W_gamma.weight)
+        if self.single:
+            mu = alpha = beta = torch.zeros_like(gamma)
+        else:
+            mu = self.mu(query).squeeze(2).float()
+            alpha, beta = read(cell_emb @ self.W_alpha.weight), read(pert_emb @ self.W_beta.weight)
+        D = mu + alpha + beta + gamma
+        D = D.masked_fill(is_control.unsqueeze(1), 0.0)
+        line = pool = torch.zeros_like(D)
+        if self.batch_terms is not None and line_next is not None:
+            on_line = (line_next != self.batch_terms["line_reference"]) & ~is_control
+            line = read(self.line_net(torch.cat([self.line_emb(line_next), cell_emb], dim=1)) @ self.W_line.weight) * on_line.unsqueeze(1)
+            on_pool = pool_source != pool_next
+            pool = read(self.pool_net(torch.cat([self.pool_emb(pool_source), cell_emb], dim=1)) @ self.W_pool.weight) * on_pool.unsqueeze(1)
+            D = D + line + pool
+        # The CLS slot and padding hold negative values: no expression.
+        source = torch.expm1(src_values.float()).clamp(min=0)
+        # Increases on the log scale directly; the decrease branch is clamped so that neither branch overflows
+        # (torch.where passes gradients through both).
+        if self.shift_rule:
+            pred = (torch.log1p(source) + D).clamp(min=0)
+        elif self.wt_rule:
+            wt = wt_mean.float()   # the group's WT mean (mu in the formula above; not the term mu)
+            ratio = ((wt + 1) * torch.exp(D.clamp(max=0)) - 1) / wt.clamp(min=1e-8)
+            ratio = torch.where(wt > 0, ratio, torch.ones_like(ratio)).clamp(min=0)   # no source has the gene
+            pred = torch.where(D > 0, torch.log1p(source) + D, torch.log1p(source * ratio))
+        else:
+            pred = torch.where(D > 0, torch.log1p(source) + D, torch.log1p(source * torch.exp(D.clamp(max=0))))
+        return {"pred": pred, "D": D, "mu": mu, "alpha": alpha, "beta": beta, "gamma": gamma, "line": line, "pool": pool, "param2": None, "zero_probs": torch.ones_like(pred), "distribution": None}
+
+
 from torch.autograd import Function
 class GradReverse(Function):
     @staticmethod

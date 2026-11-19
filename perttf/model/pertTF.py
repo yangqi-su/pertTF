@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from .base_model import BaseModel
-from .pert_encoder import encode_perturbation_set, reduce_perturbation_embeddings
+from .pert_encoder import KnockoutLookup, encode_perturbation_set, reduce_perturbation_embeddings
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from .expr_sampler import DistributionGenerator
@@ -27,6 +27,7 @@ from .modules import (
     NuisanceShift,
     NuisanceAdversary,
     NextDeltaDecoder,
+    GroupDeltaDecoder,
     )
 
 
@@ -58,6 +59,8 @@ class PerturbationTFModel(BaseModel):
         #   conditions: {label: number of levels} given to the adversaries (e.g. celltype, day)
         #   adversary: whether each nuisance gets an adversary on the cell embedding (default True)
         #   control_index: perturbation ID of the control, for the WT counterfactual
+        #   decoder_terms: with next_group_delta, the labels reach only the adversaries and the change head's line and
+        #              pool terms (GroupDeltaDecoder batch_terms, line = "background"): no encoder input, shifts or injection
         spec = kwargs.pop("nuisance_spec", None)
         self.nuisance_spec = json.loads(spec) if isinstance(spec, str) else (spec or {})
         # Width of a Gaussian noise vector given to the perturbation head; 0 disables it.
@@ -68,6 +71,32 @@ class PerturbationTFModel(BaseModel):
         # Perturbation ID of the control. With next_delta, the head then reads the next state minus the
         # control's state for the same cell and noise (with no bias), so the control leaves a cell unchanged.
         self.next_delta_control = kwargs.pop("next_delta_control", None)
+        # With next_delta and next_delta_control: decode next cells with GroupDeltaDecoder instead, from the source
+        # cell's embedding and the target's perturbation embedding (the perturbation head's state is not used).
+        self.next_group_delta = kwargs.pop("next_group_delta", False)
+        # With next_group_delta: decreases scale the source by the ratio that lowers the context's WT mean by D (see
+        # GroupDeltaDecoder). The WT means are context_wt_mean, (cell types, mvc_src genes) normalised counts in the order
+        # of the full gene list, set by the caller (not saved with the weights); forward then needs celltype_labels.
+        self.next_group_delta_wt_rule = kwargs.pop("next_group_delta_wt_rule", False)
+        # With next_group_delta: D is a change of mean log1p, added to each cell's log1p values (GroupDeltaDecoder shift_rule);
+        # train with next_group_delta_scale "mean_of_log" so the group targets are on that scale.
+        next_group_delta_shift = kwargs.pop("next_group_delta_shift", False)
+        # With next_group_delta: one undecomposed network for D (GroupDeltaDecoder single), the decomposition's ablation.
+        next_group_delta_single = kwargs.pop("next_group_delta_single", False)
+        self.context_wt_mean = None
+        # Perturbation IDs with a row in the knockout look-up (KnockoutLookup), and the chance that a knockout is hidden
+        # from its own row in training. With a table, a target knockout is represented through the look-up (the control
+        # keeps its own embedding); needs next_delta_control and single-perturbation labels.
+        pert_lookup = kwargs.pop("pert_lookup", None)
+        pert_lookup_hide = kwargs.pop("pert_lookup_hide", 0.3)
+        pert_lookup_self_bonus = kwargs.pop("pert_lookup_self_bonus", False)
+        pert_lookup_hard = kwargs.pop("pert_lookup_hard", False)
+        # Perturbation IDs seen in training. Any other target knockout gets one learned "unknown knockout" embedding,
+        # which training fits (next_unknown_weight) to each cell type's average knockout change, context_avg_change:
+        # (cell types, mvc_src genes) changes of log1p of group means, NaN rows for cell types without one, set by the
+        # caller (not saved with the weights). Needs next_delta_control.
+        pert_seen = kwargs.pop("pert_seen", None)
+        self.context_avg_change = None
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
@@ -82,13 +111,15 @@ class PerturbationTFModel(BaseModel):
         levels = self.nuisance_spec.get("levels", {})
         reference = self.nuisance_spec.get("reference", {})
         modes = {name: self.nuisance_spec.get("mode", {}).get(name, "additive") for name in levels}
-        self.nuisance_input = nn.ModuleDict({name: nn.Embedding(n, d_model) for name, n in levels.items()})
+        decoder_terms = self.nuisance_spec.get("decoder_terms", False)
+        model_levels = {} if decoder_terms else levels
+        self.nuisance_input = nn.ModuleDict({name: nn.Embedding(n, d_model) for name, n in model_levels.items()})
         self.nuisance_shift = nn.ModuleDict({
-            name: NuisanceShift(n, d_model, reference[name]) for name, n in levels.items() if modes[name] != "inject"
+            name: NuisanceShift(n, d_model, reference[name]) for name, n in model_levels.items() if modes[name] != "inject"
         })
         # The extra last level is the null label used for inject_dropout.
         self.nuisance_inject = nn.ModuleDict({
-            name: nn.Embedding(n + 1, d_model) for name, n in levels.items() if modes[name] != "additive"
+            name: nn.Embedding(n + 1, d_model) for name, n in model_levels.items() if modes[name] != "additive"
         })
         self.nuisance_adversary = nn.ModuleDict({
             name: NuisanceAdversary(d_model, n, self.nuisance_spec.get("conditions", {}))
@@ -97,7 +128,20 @@ class PerturbationTFModel(BaseModel):
         self.pert_exp_encoder = PertExpEncoder(
             d_model, self.pert_dim, extra_dim=self.noise_dim + d_model * len(self.nuisance_inject),
         )
-        if self.next_delta:
+        self.pert_lookup = KnockoutLookup(pert_lookup, n_pert, pert_dim, pert_lookup_hide, pert_lookup_self_bonus, pert_lookup_hard) \
+            if pert_lookup is not None else None
+        seen = torch.zeros(n_pert, dtype=torch.bool)
+        if pert_seen is not None:
+            seen[pert_seen] = True
+        self.register_buffer("pert_seen", seen if pert_seen is not None else None)
+        self.pert_unknown_emb = nn.Parameter(torch.zeros(pert_dim)) if pert_seen is not None else None
+        if self.next_group_delta:
+            batch_terms = {"n_lines": levels["background"], "n_pools": levels["pool"],
+                           "line_reference": reference["background"]} if decoder_terms else None
+            self.next_decoder = GroupDeltaDecoder(d_model, pert_dim, wt_rule=self.next_group_delta_wt_rule,
+                                                  shift_rule=next_group_delta_shift, batch_terms=batch_terms,
+                                                  single=next_group_delta_single)
+        elif self.next_delta:
             self.next_decoder = NextDeltaDecoder(d_model, relative=self.next_delta_control is not None)
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
@@ -313,6 +357,7 @@ class PerturbationTFModel(BaseModel):
         n_noise_draws: int = 1,
         pert_labels_control: Optional[Tensor] = None,
         mvc_src_values: Optional[Tensor] = None,
+        celltype_labels: Optional[Tensor] = None,
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -426,6 +471,13 @@ class PerturbationTFModel(BaseModel):
             #import pdb; pdb.set_trace()
             if pert_embeddings_next is None:
                 pert_emb_next = encode_perturbation_set(self.pert_encoder, pert_labels_next, self.pert_aggregation)
+                if self.pert_lookup is not None:
+                    looked_up = self.pert_lookup(pert_emb_next, self.pert_encoder(self.pert_lookup.table), pert_labels_next)
+                    is_control = (pert_labels_next == self.next_delta_control).unsqueeze(1)
+                    pert_emb_next = torch.where(is_control, pert_emb_next, looked_up)
+                if self.pert_unknown_emb is not None:
+                    unseen = ~self.pert_seen[pert_labels_next] & (pert_labels_next != self.next_delta_control)
+                    pert_emb_next = torch.where(unseen.unsqueeze(1), self.pert_unknown_emb.to(pert_emb_next.dtype), pert_emb_next)
             elif pert_embeddings_next.dim() == 3:
                 pert_emb_next = reduce_perturbation_embeddings(pert_embeddings_next, pert_labels_next, self.pert_aggregation)
             else:
@@ -462,6 +514,14 @@ class PerturbationTFModel(BaseModel):
                 target_size_factor = sf if self.distribution is not None else None
             )
             def decode_next(state, control_state=None):
+                if self.next_group_delta:
+                    is_control = pert_labels_next == self.next_delta_control
+                    wt_mean = self.context_wt_mean[celltype_labels] if self.next_group_delta_wt_rule else None
+                    labels = {}
+                    if self.next_decoder.batch_terms is not None and nuisance_labels is not None and nuisance_labels_next is not None:
+                        labels = dict(line_next=nuisance_labels_next["background"], pool_source=nuisance_labels["pool"],
+                                      pool_next=nuisance_labels_next["pool"])
+                    return self.next_decoder(cell_emb_orig, pert_emb_next, cur_gene_token_embs, mvc_src_values, is_control, wt_mean, **labels)
                 if self.next_delta:
                     if control_state is not None:
                         state = state - control_state
@@ -481,6 +541,12 @@ class PerturbationTFModel(BaseModel):
             else:
                 output["mvc_output"] = mvc_output  # (batch, seq_len)
                 output["mvc_output_next"] = mvc_output_next  # (batch, seq_len)
+            if self.training and self.pert_unknown_emb is not None and self.next_group_delta:
+                # Every source cell with the unknown knockout, for the training loss against its cell type's average change.
+                unknown = self.pert_unknown_emb.to(pert_emb_next.dtype).expand(len(pert_emb_next), -1)
+                no_control = torch.zeros_like(pert_labels_next, dtype=torch.bool)
+                wt_mean = self.context_wt_mean[celltype_labels] if self.next_group_delta_wt_rule else None
+                output["unknown_D"] = self.next_decoder(cell_emb_orig, unknown, cur_gene_token_embs, mvc_src_values, no_control, wt_mean)["D"]
             if len(next_states) > 1:
                 output["mvc_output_next_draws"] = [mvc_output_next] + [
                     decode_next(state, control_states[i] if control_states else None) for i, state in enumerate(next_states[1:], 1)

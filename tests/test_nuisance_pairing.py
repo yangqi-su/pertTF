@@ -59,6 +59,17 @@ def test_same_celltype_pairs_and_weights():
         assert total == pytest.approx(shares[rule])
 
 
+def test_p7_pairs_external_wt_to_knockouts_of_the_same_background():
+    groups = toy_groups()
+    pairs = same_celltype_pairs(groups, celltype="celltype", exclude_target_celltypes=("ESC",), rules=("P6", "P7"),
+                                p6_same_day=False, **PAIR_COLUMNS)
+    p7 = pairs.filter(pl.col("rule") == "P7")
+    assert (p7["source_genotype"] == "WT").all() and (p7["source_pool"] == "ext").all() and (p7["target_pool"] == "ko").all()
+    assert (p7["source_background"] == p7["target_background"]).all() and (p7["target_genotype"] != "WT").all()
+    assert set(p7["target_background"]) == {"HUES8"} and not (p7["target_celltype"] == "ESC").any()
+    assert (pairs.filter(pl.col("rule") == "P6")["source_celltype"] == pairs.filter(pl.col("rule") == "P6")["target_celltype"]).all()
+
+
 def test_development_pairs_weights_follow_composition():
     groups = toy_groups()
     pairs = development_pairs(groups, day_rank="day_rank", origin_rank=0, **PAIR_COLUMNS)
@@ -194,6 +205,114 @@ def test_relative_next_delta_leaves_control_cells_unchanged():
     assert not torch.allclose(out["mvc_output_next"]["pred"][1], values[1])
 
 
+@pytest.mark.parametrize("wt_rule", [False, True])
+def test_group_delta_terms_sum_to_the_change(wt_rule):
+    from perttf.model.modules import GroupDeltaDecoder
+    torch.manual_seed(0)
+    head = GroupDeltaDecoder(8, 8, wt_rule=wt_rule)
+    for layer in (head.mu, head.W_alpha, head.W_beta, head.W_gamma):
+        torch.nn.init.normal_(layer.weight, std=0.3)
+    out = head(torch.randn(5, 8), torch.randn(5, 8), torch.randn(5, 7, 8), torch.rand(5, 7), torch.zeros(5, dtype=torch.bool),
+               torch.rand(5, 7) + 0.5 if wt_rule else None)
+    torch.testing.assert_close(out["mu"] + out["alpha"] + out["beta"] + out["gamma"], out["D"])
+
+
+def test_knockout_lookup_falls_back_and_hides_own_row():
+    from perttf.model.pert_encoder import KnockoutLookup
+    torch.manual_seed(0)
+    lookup = KnockoutLookup([1, 2], n_pert=4, dim=3, hide=1.0)
+    keys, labels = torch.randn(2, 3), torch.tensor([1, 3])
+    query = torch.stack([keys[0], torch.randn(3)])
+    lookup.eval()
+    with torch.no_grad():
+        lookup.null_score.fill_(-500.0)
+        lookup.log_sharpness.fill_(5.0)
+        torch.testing.assert_close(lookup(query, keys, labels)[0], lookup.codes[0])   # a table knockout finds its own row
+        lookup.null_score.fill_(500.0)
+        torch.testing.assert_close(lookup(query, keys, labels)[1], lookup.null_code)   # no row: the no-match code
+    lookup.train()
+    assert lookup.weights(query, keys, labels)[0, 1] == 0   # hide = 1: knockout 1 never sees its own row
+
+
+def test_knockout_lookup_hard_identity_uses_own_code_unless_hidden():
+    from perttf.model.pert_encoder import KnockoutLookup
+    torch.manual_seed(0)
+    lookup = KnockoutLookup([1, 2], n_pert=4, dim=3, hide=1.0, hard_identity=True)
+    keys = torch.randn(2, 3)
+    query = torch.stack([keys[0], keys[0]])   # knockout 3 (no row) is placed exactly on knockout 1
+    labels = torch.tensor([1, 3])
+    with torch.no_grad():
+        lookup.null_code.normal_()
+        lookup.eval()
+        out = lookup(query, keys, labels)
+        torch.testing.assert_close(out[0], lookup.codes[0])   # a table knockout: exactly its own code
+        w = lookup.weights(query, keys, labels, exclude_own=torch.tensor([True, False]))
+        torch.testing.assert_close(out[1], w[1, :1] * lookup.null_code + w[1, 1:] @ lookup.codes)   # no row: the blend
+        lookup.train()   # hide = 1: knockout 1 is hidden and gets the blend of the other rows, without its own
+        hidden = lookup(query, keys, labels)[0]
+        assert w[0, 1] == 0
+        torch.testing.assert_close(hidden, w[0, :1] * lookup.null_code + w[0, 1:] @ lookup.codes)
+
+
+def test_knockout_lookup_self_bonus_finds_own_row_at_zero_sharpness():
+    from perttf.model.pert_encoder import KnockoutLookup
+    torch.manual_seed(0)
+    lookup = KnockoutLookup([1, 2], n_pert=4, dim=3, hide=0.0, self_bonus=True).eval()
+    keys = torch.randn(2, 3)
+    query = torch.stack([keys[1], keys[1]])   # knockout 3 (no row) is placed exactly on knockout 2
+    with torch.no_grad():
+        lookup.log_sharpness.fill_(-50.0)   # neighbours carry no weight beyond a uniform average
+        lookup.null_score.fill_(0.0)
+        lookup.self_bonus.fill_(50.0)
+        w = lookup.weights(query, keys, torch.tensor([2, 3]))
+    assert w[0, 2] > 0.99   # knockout 2 finds its own row through the bonus
+    torch.testing.assert_close(w[1], torch.full((3,), 1 / 3))   # knockout 3 does not, although it sits on knockout 2
+
+
+def test_group_delta_shift_rule_adds_D_to_log1p_clipped_at_0():
+    from perttf.model.modules import GroupDeltaDecoder
+    torch.manual_seed(0)
+    head = GroupDeltaDecoder(8, 8, shift_rule=True)
+    torch.nn.init.normal_(head.W_beta.weight, std=0.3)
+    src = torch.rand(5, 7)
+    out = head(torch.randn(5, 8), torch.randn(5, 8), torch.randn(5, 7, 8), src, torch.zeros(5, dtype=torch.bool))
+    torch.testing.assert_close(out["pred"], (src + out["D"]).clamp(min=0))
+
+
+def test_group_delta_single_network_is_gamma_alone():
+    from perttf.model.modules import GroupDeltaDecoder
+    torch.manual_seed(0)
+    head = GroupDeltaDecoder(8, 8, shift_rule=True, single=True)
+    assert not hasattr(head, "W_beta")
+    torch.nn.init.normal_(head.W_gamma.weight, std=0.3)
+    is_control = torch.tensor([False, True])
+    out = head(torch.randn(2, 8), torch.randn(2, 8), torch.randn(2, 7, 8), torch.rand(2, 7), is_control)
+    assert out["mu"].abs().sum() == 0 and out["alpha"].abs().sum() == 0 and out["beta"].abs().sum() == 0
+    torch.testing.assert_close(out["D"][0], out["gamma"][0])
+    assert out["D"][1].abs().sum() == 0
+
+
+def test_group_delta_line_and_pool_terms_are_zero_at_the_reference():
+    from perttf.model.modules import GroupDeltaDecoder
+    torch.manual_seed(0)
+    head = GroupDeltaDecoder(8, 8, shift_rule=True, batch_terms={"n_lines": 3, "n_pools": 2, "line_reference": 0})
+    for layer in (head.W_beta, head.W_line, head.W_pool):
+        torch.nn.init.normal_(layer.weight, std=0.3)
+    is_control = torch.tensor([False, False, False, True])
+    line_next, pool_source, pool_next = torch.tensor([0, 2, 2, 2]), torch.tensor([0, 0, 1, 1]), torch.tensor([0, 0, 0, 0])
+    out = head(torch.randn(4, 8), torch.randn(4, 8), torch.randn(4, 7, 8), torch.rand(4, 7), is_control,
+               line_next=line_next, pool_source=pool_source, pool_next=pool_next)
+    # row 0: reference line and pool; row 1: HUES8 target, same pool; row 2: HUES8 target from the external pool;
+    # row 3: WT target from the external pool (only the pool shift)
+    assert out["line"][0].abs().sum() == 0 and out["line"][3].abs().sum() == 0 and out["line"][1:3].abs().sum() > 0
+    assert out["pool"][:2].abs().sum() == 0 and out["pool"][2:].abs().sum() > 0
+    torch.testing.assert_close(out["D"][3], out["pool"][3])
+    torch.testing.assert_close(out["D"], out["mu"] * ~is_control.unsqueeze(1) + (out["alpha"] + out["beta"] + out["gamma"])
+                               * ~is_control.unsqueeze(1) + out["line"] + out["pool"])
+    plain = head(torch.randn(4, 8), torch.randn(4, 8), torch.randn(4, 7, 8), torch.rand(4, 7), is_control)
+    assert plain["line"].abs().sum() == 0 and plain["pool"].abs().sum() == 0
+
+
 def test_straight_through_counts_are_counts_around_the_prediction():
     torch.manual_seed(0)
     sf = torch.full((20000, 1), 2.0)                      # normalised = counts x 2
@@ -235,13 +354,20 @@ def test_next_group_means_match_full_expr(tmp_path):
     cells = batch["index"].numpy()
     own = next_group_means(corpus, cells, cells[:, None], [len(obs)], 10000.0)
     torch.testing.assert_close(own["means"][own["table"][cells]][:, 1:], batch["full_expr"][:, 1:])
+    # Stored cells (here every second one): each group's slice holds its kept cells, whose mean is the group mean when
+    # all of a group's cells are kept.
+    keep = cells % 2 == 0
+    stored = next_group_means(corpus, cells, (cells % 2)[:, None], [2], 10000.0, keep_cells=keep)
+    start, count = int(stored["cell_start"][0]), int(stored["cell_count"][0])
+    assert count == keep.sum() and int(stored["cell_count"][1]) == 0
+    torch.testing.assert_close(stored["cells"][start:start + count].float().mean(0), stored["means"][0], atol=2e-3, rtol=0)
 
 
 def nuisance_corpus(tmp_path):
     rng = np.random.default_rng(3)
     cells = []
     for genotype, background, pool in [("ctrl", "H1", "ko"), ("ctrl", "H1-111", "ko"), ("P1", "H1", "ko"),
-                                       ("P1", "HUES8", "ko"), ("ctrl", "H1-111", "ext")]:
+                                       ("P1", "HUES8", "ko"), ("ctrl", "H1-111", "ext"), ("ctrl", "HUES8", "ext")]:
         for celltype in ("T", "U"):
             cells += [(genotype, background, pool, celltype, "D3")] * 4
     obs = pd.DataFrame(cells, columns=["genotype", "background", "pool", "celltype", "day"])
@@ -255,12 +381,23 @@ def nuisance_corpus(tmp_path):
     return concat({"a": member}, obs_columns={c: {"a": c} for c in columns}, feature_key={"a": "index"}), obs
 
 
-@pytest.mark.parametrize("next_delta, group_loss, relative, group_energy", [
-    (False, False, False, False), (True, False, False, False), (True, True, False, False), (True, True, True, False),
-    (True, True, True, True)])
-def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_delta, group_loss, relative, group_energy):
+@pytest.mark.parametrize("next_delta, group_loss, relative, group_energy, group_delta", [
+    (False, False, False, False, False), (True, False, False, False, False), (True, True, False, False, False),
+    (True, True, True, False, False), (True, True, True, True, False), (True, True, True, False, "batch"),
+    (True, True, True, False, "group"), (True, True, True, False, "direct"), (True, True, True, False, "lookup"),
+    (True, True, True, False, "unknown"), (True, True, True, False, "shift"), (True, True, True, False, "reference")])
+def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_delta, group_loss, relative, group_energy,
+                                                 group_delta):
     torch.set_num_threads(2)
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    lookup = group_delta == "lookup"   # the "direct" setup plus the knockout look-up
+    unknown = group_delta == "unknown"   # the "direct" setup plus the unknown-knockout embedding
+    shift = group_delta == "shift"   # the "direct" loss with the mean-of-log shift rule instead of the WT-mean rule
+    # the shift rule with the reference-cell loss, the unknown knockout, line and pool terms, P6 / P7 pairs and the
+    # adversary only (section 66 of the study notes)
+    reference = group_delta == "reference"
+    unknown, shift = unknown or reference, shift or reference
+    group_delta = "direct" if lookup or (unknown and not reference) or (shift and not reference) else group_delta
     parameters = dict(
         next_cell_pred_type="pert", GEPC=True, input_emb_style="continuous",
         batch_size=8, max_seq_len=4, mask_ratio=0.5, sampling_mode="simple",
@@ -277,6 +414,13 @@ def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_del
         nuisance_adversary_weight=0.5, shift_contrastive_weight=0.5, shift_contrastive_center=True,
         next_group_loss_weight=1.0 if group_loss else 0.0,
         next_group_energy_weight=1.0 if group_energy else 0.0,
+        next_group_delta=bool(group_delta), next_group_delta_mean=group_delta or "batch",
+        next_group_interaction_weight=0.1 if group_delta else 0.0, next_group_term_weight=0.01 if group_delta else 0.0,
+        next_group_term_penalised=["alpha", "beta"] + (["line"] if reference else []) if group_delta in ("direct", "reference")
+        else ["mu", "alpha", "beta"],
+        next_unknown_weight=1.0 if unknown else 0.0,
+        next_group_delta_scale="mean_of_log" if shift else "log_of_mean", next_group_direct_weight=0.1 if reference else 0.0,
+        next_group_shrink_weight=0.1 if reference else 0.0,
     )
     if group_energy:
         np.save(tmp_path / "projection.npy", np.eye(3, 2))   # the synthetic corpus has 3 genes
@@ -291,9 +435,11 @@ def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_del
         train = np.flatnonzero(~obs.index.isin(obs.index[valid]) | (obs["genotype"] == "ctrl"))
         metadata = corpus.metadata_index.df[train]
         groups = make_groups(metadata, by=["genotype", "background", "pool", "celltype", "day"])
+        rules = ("P1", "P2", "P3", "P5", "P6") + (("P7",) if reference else ())
         pairs = same_celltype_pairs(groups, perturbation="genotype", celltype="celltype", background="background",
-                                    pool="pool", day="day", control="ctrl", reference_background="H1", reference_pool="ko")
-        pairs = branch_weights(pairs, {"P1": 0.5, "P2": 0.2, "P3": 0.1, "P5": 0.1, "P6": 0.1}, {"P5": []})
+                                    pool="pool", day="day", control="ctrl", reference_background="H1", reference_pool="ko",
+                                    rules=rules, p6_same_day=not reference)
+        pairs = branch_weights(pairs, {"P1": 0.4, "P2": 0.2, "P3": 0.1, "P5": 0.1, "P6": 0.1, "P7": 0.1}, {"P5": []})
         tokenizer = {"<pad>": 0, "<cls>": 1, "g1": 2, "g2": 3, "g3": 4}
         data_gen = produce_corpus_datasets(
             corpus, run.config, train_indices=train, valid_indices=valid,
@@ -307,12 +453,12 @@ def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_del
         assert len(loader) == 3
         batch = next(iter(loader))
         assert {"background_labels_next", "pool_labels_next", "pair_rule"} <= set(batch)
-        assert data_gen["pair_rule_names"] == ["P1", "P2", "P3", "P5", "P6"]
+        assert data_gen["pair_rule_names"] == list(rules)
         self_rows = batch["pair_rule"] == data_gen["pair_rule_names"].index("P5")
         assert torch.equal(batch["index"][self_rows], batch["next_index"][self_rows])
         spec = {"levels": {"background": 3, "pool": 2}, "reference": {"background": 0, "pool": 0},
                 "context": {"background": "source", "pool": "state"},
-                "conditions": {"celltype": len(data_gen["cell_type_to_index"])}}
+                "conditions": {"celltype": len(data_gen["cell_type_to_index"])}, "decoder_terms": reference}
         model = HFPerturbationTFModel(
             n_pert=len(data_gen["genotype_to_index"]), nlayers_pert=2, n_ps=0, d_model=16, nhead=2, d_hid=32, nlayers=1,
             vocab=data_gen["vocab"], dropout=0.0, pad_token="<pad>", pad_value=-2, do_mvc=True, do_dab=False,
@@ -320,15 +466,33 @@ def test_step_mode_training_with_nuisance_labels(tmp_path, monkeypatch, next_del
             explicit_zero_prob=False, use_fast_transformer=False, pre_norm=False, n_cls=1, nlayers_cls=2,
             input_emb_style="continuous", genotype_to_index=data_gen["genotype_to_index"],
             cell_type_to_index=data_gen["cell_type_to_index"], control_label="ctrl",
-            nuisance_spec=spec, noise_dim=4, next_delta=next_delta, next_delta_relative=relative,
+            nuisance_spec=spec, noise_dim=4, next_delta=next_delta, next_delta_relative=relative, next_group_delta=bool(group_delta),
+            next_group_delta_wt_rule=group_delta == "direct" and not shift, next_group_delta_shift=shift,
+            pert_lookup=[i for g, i in data_gen["genotype_to_index"].items() if g != "ctrl"] if lookup else None,
+            # every ID seen: the unknown-knockout embedding then moves only through next_unknown_weight
+            pert_seen=list(data_gen["genotype_to_index"].values()) if unknown else None,
         )
-        before = model.nuisance_shift["background"].fc[0].weight.detach().clone()
+        if group_delta == "direct":   # WT means per cell type on the full gene list (CLS + 3 genes)
+            model.context_wt_mean = torch.full((len(data_gen["cell_type_to_index"]), 4), 0.5)
+        if unknown:
+            model.context_avg_change = torch.full((len(data_gen["cell_type_to_index"]), 4), 0.2)
+        moved = model.nuisance_adversary["background"].fc[0].weight if reference else model.nuisance_shift["background"].fc[0].weight
+        before = moved.detach().clone()
         save_dir = tmp_path / "training"
         save_dir.mkdir()
         best = wrapper_train(model, run.config, data_gen, save_dir=save_dir, device=torch.device("cpu"))
-        assert not torch.equal(before, model.nuisance_shift["background"].fc[0].weight)
-        if group_loss:   # the per-cell next loss is off: only the group loss moves the delta head from zero
+        assert not torch.equal(before, moved)
+        if reference:   # no label input or shifts; the line and pool terms move from zero through the P6 / P7 pairs
+            assert len(model.nuisance_input) == 0 and len(model.nuisance_shift) == 0
+            assert model.next_decoder.W_line.weight.abs().sum() > 0 and model.next_decoder.W_pool.weight.abs().sum() > 0
+        if group_delta:   # the group loss moves the decomposed head from zero
+            assert model.next_decoder.W_beta.weight.abs().sum() > 0 and model.next_decoder.W_alpha.weight.abs().sum() > 0
+        elif group_loss:   # the per-cell next loss is off: only the group loss moves the delta head from zero
             assert model.next_decoder.W_delta.weight.abs().sum() > 0
+        if lookup:
+            assert model.pert_lookup.null_code.abs().sum() > 0
+        if unknown:   # fitted by the unknown-knockout loss
+            assert model.pert_unknown_emb.abs().sum() > 0
         result = evaluate(
             best, data_gen["valid_loader"], run.config, data_gen["vocab"], device=torch.device("cpu"),
             cell_type_to_index=data_gen["cell_type_to_index"], genotype_to_index=data_gen["genotype_to_index"],

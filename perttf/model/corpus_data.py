@@ -44,13 +44,15 @@ def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column
 
 
 def next_group_means(corpus, rows: np.ndarray, codes: np.ndarray, n_levels: list[int], target_sum: float,
-                     chunk_rows: int = 1024) -> dict:
+                     chunk_rows: int = 1024, log_of_mean: bool = False, keep_cells: np.ndarray | None = None) -> dict:
     """Mean log1p expression of every group of the cells at corpus ``rows``, as the batches' full_expr.
+    With ``log_of_mean``, log1p of the mean normalised counts instead (the group change of GroupDeltaDecoder).
 
     ``codes`` (rows x labels) holds each cell's label IDs; a group is a distinct row of codes. Cells are
     scaled with the loaders' size factors, on the corpus gene axis, with full_expr's CLS column first
     (0 here). Returns {"table": ID lookup of shape n_levels (-1 where no group), "means": (groups, 1 + genes),
-    "counts": cells per group}.
+    "counts": cells per group}. With ``keep_cells`` (a mask over ``rows``), also the log1p values of those cells
+    sorted by group ("cells", fp16, CLS column first) and each group's slice of them ("cell_start", "cell_count").
     """
     unique, group = np.unique(codes, axis=0, return_inverse=True)
     group = group.ravel()
@@ -58,17 +60,33 @@ def next_group_means(corpus, rows: np.ndarray, codes: np.ndarray, n_levels: list
     dataset_index = corpus.metadata_index.df["dataset_index"].to_numpy()[rows]
     size_factor = _size_factors(corpus, rows, dataset_index, target_sum)
     sums = np.zeros((len(unique), n_genes))
+    kept = np.zeros((0 if keep_cells is None else int(keep_cells.sum()), 1 + n_genes), dtype=np.float16)
+    n_kept = 0
     for start in range(0, len(rows), chunk_rows):
         selected = slice(start, start + chunk_rows)
         batch = corpus.expression_reader.read_expression_flat(rows[selected].tolist())
         counts, _ = dense_counts(corpus, batch, genes=np.arange(n_genes))
-        np.add.at(sums, group[selected], np.log1p(counts / size_factor[selected, None]))
+        values = counts / size_factor[selected, None]
+        np.add.at(sums, group[selected], values if log_of_mean else np.log1p(values))
+        if keep_cells is not None:
+            chunk_kept = keep_cells[selected]
+            kept[n_kept:n_kept + chunk_kept.sum(), 1:] = np.log1p(values[chunk_kept])
+            n_kept += chunk_kept.sum()
     counts = np.bincount(group, minlength=len(unique))
     means = sums / counts[:, None]
+    if log_of_mean:
+        means = np.log1p(means)
     table = np.full(n_levels, -1, dtype=np.int64)
     table[tuple(unique.T)] = np.arange(len(unique))
-    return {"table": torch.as_tensor(table), "means": torch.as_tensor(np.hstack([np.zeros((len(unique), 1)), means]), dtype=torch.float32),
-            "counts": torch.as_tensor(counts, dtype=torch.float32)}
+    out = {"table": torch.as_tensor(table), "means": torch.as_tensor(np.hstack([np.zeros((len(unique), 1)), means]), dtype=torch.float32),
+           "counts": torch.as_tensor(counts, dtype=torch.float32)}
+    if keep_cells is not None:
+        kept_group = group[keep_cells]
+        order = np.argsort(kept_group, kind="stable")
+        cell_count = np.bincount(kept_group, minlength=len(unique))
+        out.update(cells=torch.as_tensor(kept[order]), cell_start=torch.as_tensor(np.cumsum(cell_count) - cell_count),
+                   cell_count=torch.as_tensor(cell_count))
+    return out
 
 
 def produce_corpus_datasets(
@@ -267,7 +285,12 @@ def produce_corpus_datasets(
         names = ("celltype", "perturbation", *next_group_labels)
         column_of = {name: column for column, name in label_fields.items()}
         codes = np.stack([frame.iloc[train_rows][column_of[name]].map(labels[name]).astype(np.int64).to_numpy() for name in names], axis=1)
-        train_loader.next_group_means = {"names": names, **next_group_means(corpus, train_rows, codes, [max(labels[n].values()) + 1 for n in names], target_sum)}
+        # next_group_delta_mean "reference": every training WT cell is kept, so the loss can apply a change to a WT group's cells.
+        keep_wt = codes[:, 1] == labels["perturbation"][control_label] if config.get("next_group_delta_mean") == "reference" else None
+        train_loader.next_group_means = {"names": names, **next_group_means(corpus, train_rows, codes, [max(labels[n].values()) + 1 for n in names], target_sum,
+                                                                            log_of_mean=config.get("next_group_delta", False)
+                                                                            and config.get("next_group_delta_scale", "log_of_mean") == "log_of_mean",
+                                                                            keep_cells=keep_wt)}
     reference_groups = corpus_reference_groups(
         corpus, valid_rows, context_column=celltype_column,
         perturbation_column=perturbation_column, gene_mask=metric_gene_mask,

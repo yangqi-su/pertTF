@@ -80,6 +80,15 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         noise_dim: int = 0,
         next_delta: bool = False,
         next_delta_relative: bool = False,
+        next_group_delta: bool = False,
+        next_group_delta_wt_rule: bool = False,
+        next_group_delta_shift: bool = False,
+        next_group_delta_single: bool = False,
+        pert_lookup: Optional[list] = None,
+        pert_lookup_hide: float = 0.3,
+        pert_lookup_self_bonus: bool = False,
+        pert_lookup_hard: bool = False,
+        pert_seen: Optional[list] = None,
         **kwargs
     ):
         # 1. Handle Training Config & Extras
@@ -194,6 +203,15 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             noise_dim=noise_dim,
             next_delta=next_delta,
             next_delta_control=self.genotype_to_index[control_label] if next_delta_relative else None,
+            next_group_delta=next_group_delta,
+            next_group_delta_wt_rule=next_group_delta_wt_rule,
+            next_group_delta_shift=next_group_delta_shift,
+            next_group_delta_single=next_group_delta_single,
+            pert_lookup=pert_lookup,
+            pert_lookup_hide=pert_lookup_hide,
+            pert_lookup_self_bonus=pert_lookup_self_bonus,
+            pert_lookup_hard=pert_lookup_hard,
+            pert_seen=pert_seen,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
 

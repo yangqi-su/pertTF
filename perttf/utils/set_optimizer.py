@@ -77,9 +77,16 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_
         from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 
         embedding_ids = _embedding_parameter_ids(model)
+        # The knockout look-up (a code table and three scalars) and the unknown-knockout embedding get their own Adam
+        # group: at the auxiliary rate its no-match score and sharpness, or that embedding, would barely move in a run.
+        lookup = getattr(model, 'pert_lookup', None)
+        lookup_params = list(lookup.parameters()) if lookup is not None else []
+        if getattr(model, 'pert_unknown_emb', None) is not None:
+            lookup_params.append(model.pert_unknown_emb)
+        lookup_ids = {id(p) for p in lookup_params}
         muon_params, adam_params = [], []
         for parameter in model.parameters():
-            if not parameter.requires_grad:
+            if not parameter.requires_grad or id(parameter) in lookup_ids:
                 continue
             if parameter.ndim >= 2 and id(parameter) not in embedding_ids:
                 muon_params.append(parameter)
@@ -93,6 +100,9 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_
             {'params': adam_params, 'use_muon': False, 'lr': config.lr * aux_lr_ratio,
              'betas': (0.9, 0.95), 'weight_decay': weight_decay},
         ]
+        if lookup_params:
+            param_groups.append({'params': lookup_params, 'use_muon': False, 'lr': config.get('lookup_lr', 1e-3),
+                                 'betas': (0.9, 0.95), 'weight_decay': 0.0})
         muon_class = MuonWithAuxAdam if torch.distributed.is_initialized() else SingleDeviceMuonWithAuxAdam
         optimizer = muon_class(param_groups)
         optimizer_config.update(muon_aux_lr_ratio=aux_lr_ratio, weight_decay=weight_decay)
